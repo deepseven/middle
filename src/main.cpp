@@ -12,6 +12,8 @@
 // ourselves so we can retry instead of losing data.
 #include <host/ble_gatt.h>
 #include <host/ble_hs_mbuf.h>
+#include <nvs.h>
+#include <nvs_flash.h>
 
 static const int pin_button = 2;
 static const int pin_battery = 1;
@@ -168,6 +170,8 @@ static const char *characteristic_command_uuid =
     "19b10004-e8f2-537e-4f6c-d104768a1214";
 static const char *characteristic_voltage_uuid =
     "19b10005-e8f2-537e-4f6c-d104768a1214";
+static const char *characteristic_pairing_uuid =
+    "19b10006-e8f2-537e-4f6c-d104768a1214";
 
 static const uint8_t command_request_next = 0x01;
 static const uint8_t command_ack_received = 0x02;
@@ -179,10 +183,12 @@ static BLECharacteristic *file_count_characteristic = nullptr;
 static BLECharacteristic *file_info_characteristic = nullptr;
 static BLECharacteristic *audio_data_characteristic = nullptr;
 static BLECharacteristic *voltage_characteristic = nullptr;
+static BLECharacteristic *pairing_characteristic = nullptr;
 static BLEAdvertising *ble_advertising = nullptr;
 
 static volatile uint8_t pending_command = 0;
 static volatile bool client_connected = false;
+static volatile bool connection_authenticated = false;
 static volatile uint16_t pending_recording_count = 0;
 static volatile bool sleep_requested = false;
 static bool littlefs_ready = false;
@@ -225,6 +231,19 @@ static void start_ble_advertising() {
   hard_sleep_deadline_milliseconds = millis() + 30000;
   if (!ble_advertising->start()) {
     Serial.printf("[ble] advertising start failed\r\n");
+  }
+}
+
+// Restarts advertising after a disconnect without touching either sleep timer.
+// Only start_ble_advertising() (called on initial BLE bring-up) is allowed to
+// set the deadlines; unauthenticated connect/disconnect cycles must not extend
+// them.
+static void resume_ble_advertising() {
+  if (ble_advertising == nullptr) {
+    return;
+  }
+  if (!ble_advertising->start()) {
+    Serial.printf("[ble] advertising resume failed\r\n");
   }
 }
 
@@ -624,17 +643,66 @@ static uint16_t read_battery_millivolts() {
   return (uint16_t)(raw * factor / 10000);
 }
 
+static const size_t pairing_token_length = 16;
+static const char *nvs_namespace = "middle";
+static const char *nvs_key_pair_token = "pair_token";
+
+// Reads the stored pairing token from NVS into `out_token`. Returns true if a
+// token was found (pendant is claimed), false if absent (unclaimed).
+static bool nvs_read_pair_token(uint8_t out_token[pairing_token_length]) {
+  nvs_handle_t handle;
+  esp_err_t err = nvs_open(nvs_namespace, NVS_READONLY, &handle);
+  if (err == ESP_ERR_NVS_NOT_FOUND) {
+    return false;
+  }
+  if (err != ESP_OK) {
+    Serial.printf("[ble] nvs_open read failed: %d\r\n", err);
+    return false;
+  }
+  size_t length = pairing_token_length;
+  err = nvs_get_blob(handle, nvs_key_pair_token, out_token, &length);
+  nvs_close(handle);
+  if (err == ESP_ERR_NVS_NOT_FOUND) {
+    return false;
+  }
+  if (err != ESP_OK || length != pairing_token_length) {
+    Serial.printf("[ble] nvs_get_blob failed: %d\r\n", err);
+    return false;
+  }
+  return true;
+}
+
+// Writes `token` to NVS, claiming the pendant.
+static bool nvs_write_pair_token(const uint8_t token[pairing_token_length]) {
+  nvs_handle_t handle;
+  esp_err_t err = nvs_open(nvs_namespace, NVS_READWRITE, &handle);
+  if (err != ESP_OK) {
+    Serial.printf("[ble] nvs_open write failed: %d\r\n", err);
+    return false;
+  }
+  err = nvs_set_blob(handle, nvs_key_pair_token, token, pairing_token_length);
+  if (err == ESP_OK) {
+    err = nvs_commit(handle);
+  }
+  nvs_close(handle);
+  if (err != ESP_OK) {
+    Serial.printf("[ble] nvs_set_blob/commit failed: %d\r\n", err);
+    return false;
+  }
+  return true;
+}
+
 class server_callbacks : public BLEServerCallbacks {
   void onConnect(BLEServer *server) override {
     client_connected = true;
-    ble_active_until_milliseconds = millis() + ble_keepalive_milliseconds;
   }
 
   void onDisconnect(BLEServer *server) override {
     client_connected = false;
+    connection_authenticated = false;
     pending_command = 0;
     if (pending_recording_count > 0) {
-      start_ble_advertising();
+      resume_ble_advertising();
     } else {
       sleep_requested = true;
     }
@@ -646,6 +714,50 @@ class command_callbacks : public BLECharacteristicCallbacks {
     String value = characteristic->getValue();
     if (value.length() > 0) {
       pending_command = (uint8_t)value[0];
+    }
+  }
+};
+
+class pairing_callbacks : public BLECharacteristicCallbacks {
+  void onRead(BLECharacteristic *characteristic) override {
+    uint8_t stored_token[pairing_token_length];
+    uint8_t status = nvs_read_pair_token(stored_token) ? 0x01 : 0x00;
+    characteristic->setValue(&status, 1);
+  }
+
+  void onWrite(BLECharacteristic *characteristic) override {
+    String value = characteristic->getValue();
+    if ((size_t)value.length() != pairing_token_length) {
+      Serial.printf("[ble] pairing write wrong length %d, disconnecting\r\n",
+                    value.length());
+      ble_server->disconnect(ble_server->getConnId());
+      return;
+    }
+
+    const uint8_t *written_token = (const uint8_t *)value.c_str();
+    uint8_t stored_token[pairing_token_length];
+    bool claimed = nvs_read_pair_token(stored_token);
+
+    if (!claimed) {
+      if (!nvs_write_pair_token(written_token)) {
+        // NVS write failed — disconnect rather than silently grant access.
+        ble_server->disconnect(ble_server->getConnId());
+        return;
+      }
+      Serial.printf("[ble] paired with new token\r\n");
+      connection_authenticated = true;
+      ble_active_until_milliseconds = millis() + ble_keepalive_milliseconds;
+      hard_sleep_deadline_milliseconds = millis() + 30000;
+    } else {
+      if (memcmp(written_token, stored_token, pairing_token_length) != 0) {
+        Serial.printf("[ble] token mismatch, disconnecting\r\n");
+        ble_server->disconnect(ble_server->getConnId());
+        return;
+      }
+      Serial.printf("[ble] token verified\r\n");
+      connection_authenticated = true;
+      ble_active_until_milliseconds = millis() + ble_keepalive_milliseconds;
+      hard_sleep_deadline_milliseconds = millis() + 30000;
     }
   }
 };
@@ -674,6 +786,11 @@ static void init_ble() {
       characteristic_voltage_uuid, BLECharacteristic::PROPERTY_READ);
   uint16_t initial_voltage = 0;
   voltage_characteristic->setValue(initial_voltage);
+
+  pairing_characteristic = service->createCharacteristic(
+      characteristic_pairing_uuid,
+      BLECharacteristic::PROPERTY_READ | BLECharacteristic::PROPERTY_WRITE);
+  pairing_characteristic->setCallbacks(new pairing_callbacks());
 
   update_file_count();
   uint32_t file_size = 0;
@@ -705,6 +822,10 @@ void setup() {
   set_status_led_off();
 
   pinMode(pin_button, INPUT_PULLUP);
+
+  // NVS must be initialized before any NVS reads, including the pairing token
+  // check in init_ble(). nvs_flash_init() is safe to call on every boot.
+  nvs_flash_init();
 
   configure_button_wakeup();
   esp_sleep_wakeup_cause_t wakeup_cause = esp_sleep_get_wakeup_cause();
@@ -745,7 +866,9 @@ void loop() {
     uint8_t command = pending_command;
     pending_command = 0;
 
-    if (command == command_request_next) {
+    if (!connection_authenticated) {
+      Serial.printf("[ble] command rejected, not authenticated\r\n");
+    } else if (command == command_request_next) {
       stream_current_file();
     } else if (command == command_ack_received) {
       String path_to_delete = current_stream_path;

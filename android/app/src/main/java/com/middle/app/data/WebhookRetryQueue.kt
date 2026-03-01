@@ -12,6 +12,7 @@ import org.json.JSONException
 import org.json.JSONObject
 import java.io.File
 import java.util.UUID
+import java.util.concurrent.atomic.AtomicBoolean
 
 private const val TAG = "WebhookRetryQueue"
 private const val MAX_RETRIES = 10
@@ -22,6 +23,7 @@ class WebhookRetryQueue(context: Context, private val scope: CoroutineScope) {
 
     private val webhooksDirectory = File(context.filesDir, "webhooks").also { it.mkdirs() }
     private var retryJob: Job? = null
+    private val isProcessing = AtomicBoolean(false)
 
     fun startRetryLoopIfNeeded() {
         if (retryJob?.isActive == true) return
@@ -56,66 +58,73 @@ class WebhookRetryQueue(context: Context, private val scope: CoroutineScope) {
     }
 
     fun processRetries() {
-        val files = webhooksDirectory.listFiles { file -> file.extension == "json" }
-            ?: return
+        // Guard against concurrent invocations from multiple call sites before
+        // the retryJob?.isActive check in startRetryLoopIfNeeded catches up.
+        if (!isProcessing.compareAndSet(false, true)) return
+        try {
+            val files = webhooksDirectory.listFiles { file -> file.extension == "json" }
+                ?: return
 
-        for (file in files) {
-            val json = try {
-                JSONObject(file.readText())
-            } catch (exception: JSONException) {
-                WebhookLog.error("Malformed retry file ${file.name}, discarding")
-                Log.w(TAG, "Malformed retry file ${file.name}", exception)
-                file.delete()
-                continue
-            }
-
-            val transcript = json.optString("transcript")
-            val webhookUrl = json.optString("webhookUrl")
-            val bodyTemplate = json.optString("bodyTemplate")
-            val retryCount = json.optInt("retryCount", 0)
-            val lastRetryTimeMillis = json.optLong("lastRetryTimeMillis", 0L)
-            val recordingFilename = json.optString("filename")
-
-            val delayMillis = minOf(
-                (1L shl retryCount) * BASE_DELAY_MILLIS,
-                MAX_DELAY_MILLIS,
-            )
-            val nextRetryTimeMillis = lastRetryTimeMillis + delayMillis
-
-            if (System.currentTimeMillis() < nextRetryTimeMillis) {
-                continue
-            }
-
-            val result = try {
-                WebhookClient.post(webhookUrl, transcript, bodyTemplate)
-            } catch (exception: Exception) {
-                WebhookLog.error("Webhook retry exception for $recordingFilename: ${exception.message}")
-                Log.w(TAG, "Webhook retry exception for $recordingFilename", exception)
-                handleRetryableFailure(file, json, retryCount, recordingFilename)
-                continue
-            }
-
-            when {
-                result.success -> {
+            for (file in files) {
+                val json = try {
+                    JSONObject(file.readText())
+                } catch (exception: JSONException) {
+                    WebhookLog.error("Malformed retry file ${file.name}, discarding")
+                    Log.w(TAG, "Malformed retry file ${file.name}", exception)
                     file.delete()
-                    WebhookLog.info("Webhook retry succeeded for $recordingFilename (attempt ${retryCount + 1})")
-                    Log.d(TAG, "Webhook retry succeeded for $recordingFilename")
+                    continue
                 }
-                result.code in 400..499 -> {
-                    file.delete()
-                    WebhookLog.error(
-                        "Webhook abandoned for $recordingFilename: client error ${result.code} ${result.message}",
-                    )
-                    Log.w(TAG, "Webhook abandoned for $recordingFilename: ${result.code}")
+
+                val transcript = json.optString("transcript")
+                val webhookUrl = json.optString("webhookUrl")
+                val bodyTemplate = json.optString("bodyTemplate")
+                val retryCount = json.optInt("retryCount", 0)
+                val lastRetryTimeMillis = json.optLong("lastRetryTimeMillis", 0L)
+                val recordingFilename = json.optString("filename")
+
+                val delayMillis = minOf(
+                    (1L shl retryCount) * BASE_DELAY_MILLIS,
+                    MAX_DELAY_MILLIS,
+                )
+                val nextRetryTimeMillis = lastRetryTimeMillis + delayMillis
+
+                if (System.currentTimeMillis() < nextRetryTimeMillis) {
+                    continue
                 }
-                else -> {
-                    // 5xx or unexpected codes are treated as retryable.
-                    WebhookLog.error(
-                        "Webhook retry failed for $recordingFilename: ${result.code} ${result.message}",
-                    )
+
+                val result = try {
+                    WebhookClient.post(webhookUrl, transcript, bodyTemplate)
+                } catch (exception: Exception) {
+                    WebhookLog.error("Webhook retry exception for $recordingFilename: ${exception.message}")
+                    Log.w(TAG, "Webhook retry exception for $recordingFilename", exception)
                     handleRetryableFailure(file, json, retryCount, recordingFilename)
+                    continue
+                }
+
+                when {
+                    result.success -> {
+                        file.delete()
+                        WebhookLog.info("Webhook retry succeeded for $recordingFilename (attempt ${retryCount + 1})")
+                        Log.d(TAG, "Webhook retry succeeded for $recordingFilename")
+                    }
+                    result.code in 400..499 -> {
+                        file.delete()
+                        WebhookLog.error(
+                            "Webhook abandoned for $recordingFilename: client error ${result.code} ${result.message}",
+                        )
+                        Log.w(TAG, "Webhook abandoned for $recordingFilename: ${result.code}")
+                    }
+                    else -> {
+                        // 5xx or unexpected codes are treated as retryable.
+                        WebhookLog.error(
+                            "Webhook retry failed for $recordingFilename: ${result.code} ${result.message}",
+                        )
+                        handleRetryableFailure(file, json, retryCount, recordingFilename)
+                    }
                 }
             }
+        } finally {
+            isProcessing.set(false)
         }
     }
 

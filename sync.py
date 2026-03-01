@@ -16,8 +16,10 @@ recordings, saves them as WAV files, and acknowledges receipt so the pendant
 can delete them from flash.
 
 """
+import argparse
 import asyncio
 import os
+import secrets
 import struct
 import time
 from datetime import datetime
@@ -35,6 +37,7 @@ CHARACTERISTIC_FILE_INFO_UUID = "19b10002-e8f2-537e-4f6c-d104768a1214"
 CHARACTERISTIC_AUDIO_DATA_UUID = "19b10003-e8f2-537e-4f6c-d104768a1214"
 CHARACTERISTIC_COMMAND_UUID = "19b10004-e8f2-537e-4f6c-d104768a1214"
 CHARACTERISTIC_VOLTAGE_UUID = "19b10005-e8f2-537e-4f6c-d104768a1214"
+CHARACTERISTIC_PAIRING_UUID = "19b10006-e8f2-537e-4f6c-d104768a1214"
 
 COMMAND_REQUEST_NEXT = bytes([0x01])
 COMMAND_ACK_RECEIVED = bytes([0x02])
@@ -166,6 +169,41 @@ def transcribe_mp3_file(openai_client: OpenAI, filepath: Path) -> Path:
     print("----- transcript end -------")
 
     return transcript_path
+
+
+async def perform_pairing_handshake(
+    client: BleakClient,
+    token_hex: str | None,
+) -> bool:
+    """Perform the pairing handshake before any file operations.
+
+    Returns True if pairing succeeded, False if it failed (e.g. pendant is
+    claimed but no token was provided).
+    """
+    raw_status = await client.read_gatt_char(CHARACTERISTIC_PAIRING_UUID)
+    status = raw_status[0]
+
+    if status == 0x00:
+        # Pendant is unclaimed: claim it now.
+        if token_hex is not None:
+            token = bytes.fromhex(token_hex)
+        else:
+            token = secrets.token_bytes(16)
+        await client.write_gatt_char(CHARACTERISTIC_PAIRING_UUID, token)
+        log(f"Pendant claimed with token: {token.hex()}")
+    elif status == 0x01:
+        # Pendant is already claimed: authenticate with the provided token.
+        if token_hex is None:
+            log("Pendant is claimed. Provide --token <hex> to authenticate.")
+            return False
+        token = bytes.fromhex(token_hex)
+        await client.write_gatt_char(CHARACTERISTIC_PAIRING_UUID, token)
+        log("Token verified.")
+    else:
+        log(f"Unexpected pairing status byte: {status:#04x}")
+        return False
+
+    return True
 
 
 async def sync_recordings(
@@ -369,7 +407,7 @@ async def sync_recordings(
     return synced, saved_recordings
 
 
-async def main() -> None:
+async def main(token_hex: str | None = None) -> None:
     log("Middle BLE sync client started.")
     log(f"Recordings will be saved to: {RECORDINGS_DIRECTORY}")
     log(f"Scanning for pendant (service {SERVICE_UUID})...")
@@ -396,6 +434,10 @@ async def main() -> None:
         try:
             async with BleakClient(device, timeout=10) as client:
                 log(f"Connected (MTU: {client.mtu_size}).")
+                paired = await perform_pairing_handshake(client, token_hex)
+                if not paired:
+                    log("Pairing failed, disconnecting.")
+                    continue
                 synced, saved_recordings = await sync_recordings(
                     client,
                     openai_client,
@@ -415,4 +457,22 @@ async def main() -> None:
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    parser = argparse.ArgumentParser(
+        description="BLE sync client for the Middle pendant."
+    )
+    parser.add_argument(
+        "--token",
+        type=str,
+        default=None,
+        help="32-character hex pairing token.",
+    )
+    args = parser.parse_args()
+
+    if args.token is not None:
+        if len(args.token) != 32 or not all(
+            character in "0123456789abcdefABCDEF" for character in args.token
+        ):
+            print("Error: --token must be exactly 32 hexadecimal characters.")
+            raise SystemExit(1)
+
+    asyncio.run(main(token_hex=args.token))

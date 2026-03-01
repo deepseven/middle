@@ -28,6 +28,12 @@ class SettingsViewModel(application: Application) : AndroidViewModel(application
     private val _webhookBodyTemplate = MutableStateFlow(settings.webhookBodyTemplate)
     val webhookBodyTemplate: StateFlow<String> = _webhookBodyTemplate
 
+    private val _isPaired = MutableStateFlow(settings.isPaired)
+    val isPaired: StateFlow<Boolean> = _isPaired
+
+    private val _pairingToken = MutableStateFlow(settings.pairingToken)
+    val pairingToken: StateFlow<String> = _pairingToken
+
     fun setApiKey(key: String) {
         settings.openAiApiKey = key
         _apiKey.value = key
@@ -56,5 +62,11 @@ class SettingsViewModel(application: Application) : AndroidViewModel(application
     fun setWebhookBodyTemplate(template: String) {
         settings.webhookBodyTemplate = template
         _webhookBodyTemplate.value = template
+    }
+
+    fun unpairPendant() {
+        settings.clearPairing()
+        _isPaired.value = false
+        _pairingToken.value = ""
     }
 }

@@ -17,7 +17,6 @@ import com.middle.app.data.RecordingsRepository
 import com.middle.app.data.Settings
 import com.middle.app.data.WebhookClient
 import com.middle.app.data.WebhookLog
-import com.middle.app.data.WebhookRetryQueue
 import com.middle.app.transcription.TranscriptionClient
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
@@ -28,6 +27,7 @@ import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.launch
+import java.security.SecureRandom
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
@@ -40,13 +40,11 @@ class SyncForegroundService : Service() {
 
     private lateinit var repository: RecordingsRepository
     private lateinit var settings: Settings
-    private lateinit var retryQueue: WebhookRetryQueue
 
     override fun onCreate() {
         super.onCreate()
         repository = (application as MiddleApplication).repository
         settings = Settings(this)
-        retryQueue = WebhookRetryQueue(this, scope)
         _batteryVoltage.value = settings.lastBatteryVoltage
         startForegroundNotification(getString(R.string.sync_notification_idle))
         startScanLoop()
@@ -103,9 +101,17 @@ class SyncForegroundService : Service() {
         val adapter = bluetoothManager?.adapter ?: return
         val scanner = adapter.bluetoothLeScanner ?: return
 
-        val filter = ScanFilter.Builder()
-            .setServiceUuid(ParcelUuid(SERVICE_UUID))
-            .build()
+        // When paired, filter by MAC so we only wake up for our pendant.
+        // When not paired, filter by service UUID to discover any pendant.
+        val filter = if (settings.isPaired) {
+            ScanFilter.Builder()
+                .setDeviceAddress(settings.pairedDeviceAddress)
+                .build()
+        } else {
+            ScanFilter.Builder()
+                .setServiceUuid(ParcelUuid(SERVICE_UUID))
+                .build()
+        }
 
         val scanSettings = ScanSettings.Builder()
             .setScanMode(ScanSettings.SCAN_MODE_LOW_LATENCY)
@@ -149,12 +155,32 @@ class SyncForegroundService : Service() {
     }
 
     private suspend fun syncWithDevice(scanResult: ScanResult) {
-        retryQueue.startRetryLoopIfNeeded()
+        (application as MiddleApplication).retryQueue.startRetryLoopIfNeeded()
         val manager = PendantBleManager(this)
         try {
             updateNotification(getString(R.string.sync_notification_connecting))
             manager.connectTo(scanResult.device)
             Log.d(TAG, "Connected to pendant.")
+
+            val pairingStatus = manager.readPairingStatus()
+            if (settings.isPaired) {
+                // We have a stored token — write it so the firmware can verify us.
+                manager.writePairingToken(hexToBytes(settings.pairingToken))
+                Log.d(TAG, "[sync] token sent to pendant.")
+            } else {
+                if (pairingStatus == 0x00) {
+                    // Pendant is unclaimed — claim it with a fresh random token.
+                    val token = generatePairingToken()
+                    manager.writePairingToken(token)
+                    settings.pairingToken = bytesToHex(token)
+                    settings.pairedDeviceAddress = scanResult.device.address
+                    Log.d(TAG, "[sync] pendant claimed, stored token and MAC.")
+                } else {
+                    // Pendant is already claimed by a different device.
+                    Log.w(TAG, "[sync] pendant already claimed, skipping.")
+                    return
+                }
+            }
 
             val millivolts = manager.readVoltageMillivolts()
             if (millivolts != null) {
@@ -219,6 +245,7 @@ class SyncForegroundService : Service() {
                                         Settings.DEFAULT_WEBHOOK_BODY_TEMPLATE
                                     }
                                     WebhookLog.info("POST $webhookUrl ($filename)")
+                                    val appRetryQueue = (application as MiddleApplication).retryQueue
                                     try {
                                         val result = WebhookClient.post(webhookUrl, text, template)
                                         if (result.success) {
@@ -228,13 +255,13 @@ class SyncForegroundService : Service() {
                                             Log.w(TAG, "Webhook POST failed with status ${result.code} for $filename.")
                                             WebhookLog.error("${result.code} ${result.message} ($filename): ${result.body}")
                                             if (result.code !in 400..499) {
-                                                retryQueue.enqueue(text, webhookUrl, template, filename)
+                                                appRetryQueue.enqueue(text, webhookUrl, template, filename)
                                             }
                                         }
                                     } catch (exception: Exception) {
                                         Log.w(TAG, "Webhook POST error for $filename: $exception")
                                         WebhookLog.error("$filename: ${exception::class.simpleName}: ${exception.message}")
-                                        retryQueue.enqueue(text, webhookUrl, template, filename)
+                                        appRetryQueue.enqueue(text, webhookUrl, template, filename)
                                     }
                                 }
                             } else {
@@ -260,6 +287,18 @@ class SyncForegroundService : Service() {
             updateNotification(getString(R.string.sync_notification_scanning))
         }
     }
+
+    private fun generatePairingToken(): ByteArray {
+        val bytes = ByteArray(16)
+        SecureRandom().nextBytes(bytes)
+        return bytes
+    }
+
+    private fun bytesToHex(bytes: ByteArray): String =
+        bytes.joinToString("") { "%02x".format(it) }
+
+    private fun hexToBytes(hex: String): ByteArray =
+        ByteArray(hex.length / 2) { hex.substring(it * 2, it * 2 + 2).toInt(16).toByte() }
 
     companion object {
         private const val TAG = "SyncService"

@@ -26,6 +26,7 @@ class PendantBleManager(context: Context) : BleManager(context) {
     private var audioDataCharacteristic: BluetoothGattCharacteristic? = null
     private var commandCharacteristic: BluetoothGattCharacteristic? = null
     private var voltageCharacteristic: BluetoothGattCharacteristic? = null
+    private var pairingCharacteristic: BluetoothGattCharacteristic? = null
 
     override fun isRequiredServiceSupported(gatt: BluetoothGatt): Boolean {
         val service = gatt.getService(SERVICE_UUID) ?: return false
@@ -35,10 +36,12 @@ class PendantBleManager(context: Context) : BleManager(context) {
         commandCharacteristic = service.getCharacteristic(CHARACTERISTIC_COMMAND_UUID)
         // Voltage is optional — older firmware may not expose it.
         voltageCharacteristic = service.getCharacteristic(CHARACTERISTIC_VOLTAGE_UUID)
+        pairingCharacteristic = service.getCharacteristic(CHARACTERISTIC_PAIRING_UUID)
         return fileCountCharacteristic != null
             && fileInfoCharacteristic != null
             && audioDataCharacteristic != null
             && commandCharacteristic != null
+            && pairingCharacteristic != null
     }
 
     override fun onServicesInvalidated() {
@@ -47,6 +50,7 @@ class PendantBleManager(context: Context) : BleManager(context) {
         audioDataCharacteristic = null
         commandCharacteristic = null
         voltageCharacteristic = null
+        pairingCharacteristic = null
     }
 
     override fun initialize() {
@@ -62,6 +66,32 @@ class PendantBleManager(context: Context) : BleManager(context) {
             .timeout(10_000)
             .useAutoConnect(false)
             .suspend()
+    }
+
+    /**
+     * Reads the pairing characteristic. Returns 0x00 if the pendant is
+     * unclaimed, or 0x01 if it is already claimed by a token.
+     */
+    suspend fun readPairingStatus(): Int {
+        val characteristic = pairingCharacteristic
+            ?: throw IllegalStateException("Not connected or service not discovered.")
+        val data = readCharacteristic(characteristic).suspend()
+        return (data.value?.firstOrNull()?.toInt() ?: 0) and 0xFF
+    }
+
+    /**
+     * Writes 16 token bytes to the pairing characteristic. If the pendant
+     * rejects the token (wrong token on a claimed device), it will disconnect
+     * us — the caller detects this via the connection state.
+     */
+    suspend fun writePairingToken(token: ByteArray) {
+        val characteristic = pairingCharacteristic
+            ?: throw IllegalStateException("Not connected or service not discovered.")
+        writeCharacteristic(
+            characteristic,
+            token,
+            BluetoothGattCharacteristic.WRITE_TYPE_DEFAULT,
+        ).suspend()
     }
 
     suspend fun readFileCount(): Int {

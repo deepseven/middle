@@ -12,7 +12,6 @@ import com.middle.app.data.RecordingsRepository
 import com.middle.app.data.Settings
 import com.middle.app.data.WebhookClient
 import com.middle.app.data.WebhookLog
-import com.middle.app.data.WebhookRetryQueue
 import com.middle.app.transcription.TranscriptionClient
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -26,7 +25,7 @@ class RecordingsViewModel(application: Application) : AndroidViewModel(applicati
 
     val repository = (application as MiddleApplication).repository
     private val settings = Settings(application)
-    private val retryQueue = WebhookRetryQueue(application, viewModelScope)
+    private val retryQueue = (application as MiddleApplication).retryQueue
 
     init {
         retryQueue.startRetryLoopIfNeeded()

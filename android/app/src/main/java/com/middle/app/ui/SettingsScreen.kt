@@ -7,22 +7,31 @@ import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.text.selection.SelectionContainer
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Menu
+import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.ExperimentalMaterial3Api
+import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Switch
 import androidx.compose.material3.Text
+import androidx.compose.material3.TextButton
 import androidx.compose.material3.TopAppBar
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.remember
+import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.input.PasswordVisualTransformation
 import androidx.compose.ui.unit.dp
 import com.middle.app.viewmodel.SettingsViewModel
@@ -39,6 +48,9 @@ fun SettingsScreen(
     val webhookEnabled by viewModel.webhookEnabled.collectAsState()
     val webhookUrl by viewModel.webhookUrl.collectAsState()
     val webhookBodyTemplate by viewModel.webhookBodyTemplate.collectAsState()
+    val isPaired by viewModel.isPaired.collectAsState()
+    val pairingToken by viewModel.pairingToken.collectAsState()
+    var showUnpairDialog by remember { mutableStateOf(false) }
 
     Scaffold(
         topBar = {
@@ -146,6 +158,54 @@ fun SettingsScreen(
                     placeholder = { Text("{\"phrase\": \"\$transcript\"}") },
                     label = { Text("Body template") },
                     supportingText = { Text("\$transcript is replaced with the transcription text") },
+                )
+            }
+
+            if (isPaired) {
+                Spacer(modifier = Modifier.height(24.dp))
+                HorizontalDivider()
+                Spacer(modifier = Modifier.height(16.dp))
+                Text("Pairing token", style = MaterialTheme.typography.titleSmall)
+                Spacer(modifier = Modifier.height(4.dp))
+                SelectionContainer {
+                    Text(
+                        text = pairingToken,
+                        style = MaterialTheme.typography.bodySmall,
+                        fontFamily = FontFamily.Monospace,
+                    )
+                }
+                Spacer(modifier = Modifier.height(16.dp))
+                OutlinedButton(
+                    onClick = { showUnpairDialog = true },
+                    modifier = Modifier.fillMaxWidth(),
+                ) {
+                    Text(
+                        "Unpair pendant",
+                        color = MaterialTheme.colorScheme.error,
+                    )
+                }
+            }
+
+            if (showUnpairDialog) {
+                AlertDialog(
+                    onDismissRequest = { showUnpairDialog = false },
+                    title = { Text("Unpair pendant?") },
+                    text = { Text("You will need to re-pair with a pendant to sync recordings.") },
+                    confirmButton = {
+                        TextButton(
+                            onClick = {
+                                viewModel.unpairPendant()
+                                showUnpairDialog = false
+                            },
+                        ) {
+                            Text("Unpair", color = MaterialTheme.colorScheme.error)
+                        }
+                    },
+                    dismissButton = {
+                        TextButton(onClick = { showUnpairDialog = false }) {
+                            Text("Cancel")
+                        }
+                    },
                 )
             }
         }
