@@ -68,7 +68,7 @@ class RecordingsViewModel(application: Application) : AndroidViewModel(applicati
         get() = settings.webhookEnabled && settings.webhookUrl.trim().isNotEmpty()
 
     val transcriptionAvailable: Boolean
-        get() = settings.transcriptionEnabled && settings.openAiApiKey.trim().isNotEmpty()
+        get() = settings.transcriptionEnabled && getSelectedProviderApiKey().isNotEmpty()
 
     fun sendWebhook(recording: Recording) {
         val webhookUrl = settings.webhookUrl.trim()
@@ -78,11 +78,17 @@ class RecordingsViewModel(application: Application) : AndroidViewModel(applicati
             val existingTranscript = recording.transcriptText
             val transcript: String
             if (existingTranscript == null) {
-                val apiKey = settings.openAiApiKey.trim()
-                val transcribed = TranscriptionClient(apiKey).transcribe(recording.audioFile)
+                val provider = settings.transcriptionProvider
+                val apiKey = getSelectedProviderApiKey()
+                if (apiKey.isEmpty()) {
+                    showToast("Transcription skipped: missing ${providerDisplayName(provider)} API key")
+                    return@launch
+                }
+
+                val transcribed = TranscriptionClient(provider, apiKey).transcribe(recording.audioFile)
                 if (transcribed == null) {
                     Log.w(TAG, "Transcription failed for ${recording.audioFile.name}, skipping webhook.")
-                    showToast("Transcription failed")
+                    showToast("Transcription failed (${providerDisplayName(provider)})")
                     return@launch
                 }
                 repository.saveTranscript(transcribed, recording.audioFile)
@@ -150,6 +156,22 @@ class RecordingsViewModel(application: Application) : AndroidViewModel(applicati
     private suspend fun showToast(message: String) {
         withContext(Dispatchers.Main) {
             Toast.makeText(getApplication(), message, Toast.LENGTH_SHORT).show()
+        }
+    }
+
+    private fun getSelectedProviderApiKey(): String {
+        return when (settings.transcriptionProvider) {
+            Settings.TRANSCRIPTION_PROVIDER_OPENAI -> settings.openAiApiKey.trim()
+            Settings.TRANSCRIPTION_PROVIDER_ELEVENLABS -> settings.elevenLabsApiKey.trim()
+            else -> ""
+        }
+    }
+
+    private fun providerDisplayName(provider: String): String {
+        return when (provider) {
+            Settings.TRANSCRIPTION_PROVIDER_OPENAI -> "OpenAI"
+            Settings.TRANSCRIPTION_PROVIDER_ELEVENLABS -> "ElevenLabs"
+            else -> provider
         }
     }
 

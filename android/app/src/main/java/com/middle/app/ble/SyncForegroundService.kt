@@ -265,10 +265,16 @@ class SyncForegroundService : Service() {
                 manager.acknowledgeFile()
 
                 if (!skipTranscription && settings.transcriptionEnabled) {
-                    val apiKey = settings.openAiApiKey
-                    if (apiKey.isNotEmpty()) {
+                    val provider = settings.transcriptionProvider
+                    val apiKey = getSelectedProviderApiKey()
+                    if (apiKey.isEmpty()) {
+                        val message = "Transcription skipped: missing ${providerDisplayName(provider)} API key"
+                        Log.w(TAG, message)
+                        updateNotification(message)
+                        skipTranscription = true
+                    } else {
                         scope.launch(Dispatchers.IO) {
-                            val client = TranscriptionClient(apiKey)
+                            val client = TranscriptionClient(provider, apiKey)
                             val text = client.transcribe(audioFile)
                             if (text != null) {
                                 repository.saveTranscript(text, audioFile)
@@ -302,6 +308,9 @@ class SyncForegroundService : Service() {
                             } else {
                                 // Disable further transcription attempts this
                                 // session if the first one fails, same as sync.py.
+                                val message = "Transcription failed (${providerDisplayName(provider)})"
+                                Log.w(TAG, message)
+                                updateNotification(message)
                                 skipTranscription = true
                             }
                         }
@@ -334,6 +343,22 @@ class SyncForegroundService : Service() {
 
     private fun hexToBytes(hex: String): ByteArray =
         ByteArray(hex.length / 2) { hex.substring(it * 2, it * 2 + 2).toInt(16).toByte() }
+
+    private fun getSelectedProviderApiKey(): String {
+        return when (settings.transcriptionProvider) {
+            Settings.TRANSCRIPTION_PROVIDER_OPENAI -> settings.openAiApiKey.trim()
+            Settings.TRANSCRIPTION_PROVIDER_ELEVENLABS -> settings.elevenLabsApiKey.trim()
+            else -> ""
+        }
+    }
+
+    private fun providerDisplayName(provider: String): String {
+        return when (provider) {
+            Settings.TRANSCRIPTION_PROVIDER_OPENAI -> "OpenAI"
+            Settings.TRANSCRIPTION_PROVIDER_ELEVENLABS -> "ElevenLabs"
+            else -> provider
+        }
+    }
 
     companion object {
         private const val TAG = "SyncService"

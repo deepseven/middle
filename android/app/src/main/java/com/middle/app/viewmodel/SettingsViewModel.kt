@@ -10,8 +10,14 @@ class SettingsViewModel(application: Application) : AndroidViewModel(application
 
     private val settings = Settings(application)
 
-    private val _apiKey = MutableStateFlow(settings.openAiApiKey)
-    val apiKey: StateFlow<String> = _apiKey
+    private val _openAiApiKey = MutableStateFlow(settings.openAiApiKey)
+    val openAiApiKey: StateFlow<String> = _openAiApiKey
+
+    private val _elevenLabsApiKey = MutableStateFlow(settings.elevenLabsApiKey)
+    val elevenLabsApiKey: StateFlow<String> = _elevenLabsApiKey
+
+    private val _transcriptionProvider = MutableStateFlow(settings.transcriptionProvider)
+    val transcriptionProvider: StateFlow<String> = _transcriptionProvider
 
     private val _backgroundSyncEnabled = MutableStateFlow(settings.backgroundSyncEnabled)
     val backgroundSyncEnabled: StateFlow<Boolean> = _backgroundSyncEnabled
@@ -34,9 +40,19 @@ class SettingsViewModel(application: Application) : AndroidViewModel(application
     private val _pairingToken = MutableStateFlow(settings.pairingToken)
     val pairingToken: StateFlow<String> = _pairingToken
 
-    fun setApiKey(key: String) {
+    fun setOpenAiApiKey(key: String) {
         settings.openAiApiKey = key
-        _apiKey.value = key
+        _openAiApiKey.value = key
+    }
+
+    fun setElevenLabsApiKey(key: String) {
+        settings.elevenLabsApiKey = key
+        _elevenLabsApiKey.value = key
+    }
+
+    fun setTranscriptionProvider(provider: String) {
+        settings.transcriptionProvider = provider
+        _transcriptionProvider.value = provider
     }
 
     fun setBackgroundSync(enabled: Boolean) {

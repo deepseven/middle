@@ -18,6 +18,7 @@ import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.OutlinedTextField
+import androidx.compose.material3.RadioButton
 import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Switch
 import androidx.compose.material3.Text
@@ -34,6 +35,7 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.input.PasswordVisualTransformation
 import androidx.compose.ui.unit.dp
+import com.middle.app.data.Settings
 import com.middle.app.viewmodel.SettingsViewModel
 
 @OptIn(ExperimentalMaterial3Api::class)
@@ -42,7 +44,9 @@ fun SettingsScreen(
     viewModel: SettingsViewModel,
     onOpenDrawer: () -> Unit,
 ) {
-    val apiKey by viewModel.apiKey.collectAsState()
+    val transcriptionProvider by viewModel.transcriptionProvider.collectAsState()
+    val openAiApiKey by viewModel.openAiApiKey.collectAsState()
+    val elevenLabsApiKey by viewModel.elevenLabsApiKey.collectAsState()
     val backgroundSync by viewModel.backgroundSyncEnabled.collectAsState()
     val transcription by viewModel.transcriptionEnabled.collectAsState()
     val webhookEnabled by viewModel.webhookEnabled.collectAsState()
@@ -51,6 +55,16 @@ fun SettingsScreen(
     val isPaired by viewModel.isPaired.collectAsState()
     val pairingToken by viewModel.pairingToken.collectAsState()
     var showUnpairDialog by remember { mutableStateOf(false) }
+
+    val isOpenAiProvider = transcriptionProvider == Settings.TRANSCRIPTION_PROVIDER_OPENAI
+    val apiKey = if (isOpenAiProvider) openAiApiKey else elevenLabsApiKey
+    val apiKeyLabel = if (isOpenAiProvider) "OpenAI API key" else "ElevenLabs API key"
+    val apiKeyPlaceholder = if (isOpenAiProvider) "sk-..." else "xi-..."
+    val apiKeyHelp = if (isOpenAiProvider) {
+        "Create an API key in your OpenAI account settings."
+    } else {
+        "Create an API key in your ElevenLabs profile settings."
+    }
 
     Scaffold(
         topBar = {
@@ -70,16 +84,56 @@ fun SettingsScreen(
                 .padding(padding)
                 .padding(16.dp),
         ) {
-            Text("OpenAI API key", style = MaterialTheme.typography.titleSmall)
+            Text("Transcription provider", style = MaterialTheme.typography.titleSmall)
+            Spacer(modifier = Modifier.height(4.dp))
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                RadioButton(
+                    selected = isOpenAiProvider,
+                    onClick = { viewModel.setTranscriptionProvider(Settings.TRANSCRIPTION_PROVIDER_OPENAI) },
+                )
+                Text("OpenAI")
+                Spacer(modifier = Modifier.weight(1f))
+                RadioButton(
+                    selected = !isOpenAiProvider,
+                    onClick = { viewModel.setTranscriptionProvider(Settings.TRANSCRIPTION_PROVIDER_ELEVENLABS) },
+                )
+                Text("ElevenLabs")
+            }
+
+            Spacer(modifier = Modifier.height(16.dp))
+
+            Text(apiKeyLabel, style = MaterialTheme.typography.titleSmall)
             Spacer(modifier = Modifier.height(4.dp))
             OutlinedTextField(
                 value = apiKey,
-                onValueChange = { viewModel.setApiKey(it) },
+                onValueChange = {
+                    if (isOpenAiProvider) {
+                        viewModel.setOpenAiApiKey(it)
+                    } else {
+                        viewModel.setElevenLabsApiKey(it)
+                    }
+                },
                 modifier = Modifier.fillMaxWidth(),
                 singleLine = true,
                 visualTransformation = PasswordVisualTransformation(),
-                placeholder = { Text("sk-...") },
+                placeholder = { Text(apiKeyPlaceholder) },
             )
+            Spacer(modifier = Modifier.height(4.dp))
+            Text(
+                text = apiKeyHelp,
+                style = MaterialTheme.typography.bodySmall,
+            )
+            if (transcription && apiKey.isBlank()) {
+                Spacer(modifier = Modifier.height(4.dp))
+                Text(
+                    text = "Automatic transcription is enabled, but this provider has no API key.",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.error,
+                )
+            }
 
             Spacer(modifier = Modifier.height(24.dp))
 

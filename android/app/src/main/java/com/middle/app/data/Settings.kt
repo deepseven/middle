@@ -20,6 +20,14 @@ class Settings(context: Context) {
         get() = prefs.getString(KEY_OPENAI_API_KEY, "") ?: ""
         set(value) = prefs.edit().putString(KEY_OPENAI_API_KEY, value).apply()
 
+    var elevenLabsApiKey: String
+        get() = prefs.getString(KEY_ELEVENLABS_API_KEY, "") ?: ""
+        set(value) = prefs.edit().putString(KEY_ELEVENLABS_API_KEY, value).apply()
+
+    var transcriptionProvider: String
+        get() = prefs.getString(KEY_TRANSCRIPTION_PROVIDER, TRANSCRIPTION_PROVIDER_OPENAI) ?: TRANSCRIPTION_PROVIDER_OPENAI
+        set(value) = prefs.edit().putString(KEY_TRANSCRIPTION_PROVIDER, value).apply()
+
     var backgroundSyncEnabled: Boolean
         get() = prefs.getBoolean(KEY_BACKGROUND_SYNC, true)
         set(value) = prefs.edit().putBoolean(KEY_BACKGROUND_SYNC, value).apply()
@@ -63,7 +71,12 @@ class Settings(context: Context) {
     }
 
     companion object {
+        const val TRANSCRIPTION_PROVIDER_OPENAI = "openai"
+        const val TRANSCRIPTION_PROVIDER_ELEVENLABS = "elevenlabs"
+
         private const val KEY_OPENAI_API_KEY = "openai_api_key"
+        private const val KEY_ELEVENLABS_API_KEY = "elevenlabs_api_key"
+        private const val KEY_TRANSCRIPTION_PROVIDER = "transcription_provider"
         private const val KEY_BACKGROUND_SYNC = "background_sync"
         private const val KEY_TRANSCRIPTION = "transcription"
         private const val KEY_WEBHOOK_ENABLED = "webhook_enabled"
