@@ -176,6 +176,7 @@ static const char *characteristic_pairing_uuid =
 static const uint8_t command_request_next = 0x01;
 static const uint8_t command_ack_received = 0x02;
 static const uint8_t command_sync_done = 0x03;
+static const uint8_t command_start_stream = 0x04;
 static const unsigned long ble_keepalive_milliseconds = 10000;
 
 static BLEServer *ble_server = nullptr;
@@ -194,6 +195,7 @@ static volatile bool sleep_requested = false;
 static bool littlefs_ready = false;
 static bool littlefs_mount_attempted = false;
 static String current_stream_path = "";
+static File pending_stream_file;
 static unsigned long ble_active_until_milliseconds = 0;
 static unsigned long hard_sleep_deadline_milliseconds = 0;
 
@@ -582,24 +584,45 @@ static bool send_notification(uint16_t connection_id, uint16_t attribute_handle,
   return false;
 }
 
-static void stream_current_file() {
+// Opens the next recording file and sets file_info_characteristic so the
+// client can read the file size before streaming begins. The file handle is
+// kept open in pending_stream_file for stream_prepared_file() to consume.
+static void prepare_current_file() {
   if (!client_connected || ble_server == nullptr) {
     return;
   }
 
   current_stream_path = next_recording_path();
   if (current_stream_path.length() == 0) {
+    uint32_t empty = 0;
+    file_info_characteristic->setValue(empty);
     return;
   }
 
-  File file = LittleFS.open(current_stream_path, FILE_READ);
-  if (!file) {
+  pending_stream_file = LittleFS.open(current_stream_path, FILE_READ);
+  if (!pending_stream_file) {
     current_stream_path = "";
+    uint32_t empty = 0;
+    file_info_characteristic->setValue(empty);
     return;
   }
 
-  uint32_t file_size = file.size();
+  uint32_t file_size = pending_stream_file.size();
   file_info_characteristic->setValue(file_size);
+}
+
+// Streams the file prepared by prepare_current_file() via BLE notifications,
+// then closes the file handle. No-op if no file was prepared.
+static void stream_prepared_file() {
+  if (!pending_stream_file) {
+    Serial.printf("[ble] stream_prepared_file called with no prepared file\r\n");
+    return;
+  }
+
+  if (!client_connected || ble_server == nullptr) {
+    pending_stream_file.close();
+    return;
+  }
 
   uint16_t connection_id = ble_server->getConnId();
   uint16_t attribute_handle = audio_data_characteristic->getHandle();
@@ -613,8 +636,8 @@ static void stream_current_file() {
     chunk_size = sizeof(chunk);
   }
 
-  while (file.available() && client_connected) {
-    int bytes_read = file.read(chunk, chunk_size);
+  while (pending_stream_file.available() && client_connected) {
+    int bytes_read = pending_stream_file.read(chunk, chunk_size);
     if (bytes_read > 0) {
       if (!send_notification(connection_id, attribute_handle, chunk,
                              bytes_read)) {
@@ -622,7 +645,7 @@ static void stream_current_file() {
       }
     }
   }
-  file.close();
+  pending_stream_file.close();
 }
 
 static uint16_t read_battery_millivolts() {
@@ -701,6 +724,9 @@ class server_callbacks : public BLEServerCallbacks {
     client_connected = false;
     connection_authenticated = false;
     pending_command = 0;
+    if (pending_stream_file) {
+      pending_stream_file.close();
+    }
     if (pending_recording_count > 0) {
       resume_ble_advertising();
     } else {
@@ -869,7 +895,9 @@ void loop() {
     if (!connection_authenticated) {
       Serial.printf("[ble] command rejected, not authenticated\r\n");
     } else if (command == command_request_next) {
-      stream_current_file();
+      prepare_current_file();
+    } else if (command == command_start_stream) {
+      stream_prepared_file();
     } else if (command == command_ack_received) {
       String path_to_delete = current_stream_path;
       if (path_to_delete.length() == 0) {

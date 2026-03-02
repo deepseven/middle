@@ -241,87 +241,102 @@ class SyncForegroundService : Service() {
 
             var skipTranscription = false
 
-            for (i in 0 until fileCount) {
-                Log.d(TAG, "Requesting file ${i + 1}/$fileCount...")
-                updateNotification("Syncing file ${i + 1}/$fileCount...")
+            // Enable notifications once for the whole session to avoid rapid
+            // CCCD churn that destabilises the GATT link between files.
+            manager.enableAudioNotifications()
+            try {
+                for (i in 0 until fileCount) {
+                    Log.d(TAG, "Requesting file ${i + 1}/$fileCount...")
+                    updateNotification("Syncing file ${i + 1}/$fileCount...")
 
-                val imaData = manager.requestNextFile()
+                    val imaData = manager.requestNextFile()
 
-                // Empty files are corrupt or aborted recordings. ACK to delete
-                // them from the pendant and continue to the next file.
-                if (imaData == null) {
-                    Log.d(TAG, "Skipping empty file ${i + 1}/$fileCount.")
+                    // Empty files are corrupt or aborted recordings. ACK to delete
+                    // them from the pendant and continue to the next file.
+                    if (imaData == null) {
+                        Log.d(TAG, "Skipping empty file ${i + 1}/$fileCount.")
+                        manager.acknowledgeFile()
+                        delay(300)
+                        continue
+                    }
+
+                    Log.d(TAG, "Received ${imaData.size} bytes.")
+
+                    val timestamp = SimpleDateFormat("yyyyMMdd_HHmmss", Locale.US).format(Date())
+                    val filename = "recording_${timestamp}_$i.m4a"
+                    val audioFile = repository.saveEncodedRecording(imaData, filename)
+                    Log.d(TAG, "Saved $filename.")
+
                     manager.acknowledgeFile()
-                    continue
-                }
+                    // Brief pause between files to let the pendant settle before
+                    // the next COMMAND_REQUEST_NEXT, reducing GATT instability.
+                    delay(300)
 
-                Log.d(TAG, "Received ${imaData.size} bytes.")
+                    if (!skipTranscription && settings.transcriptionEnabled) {
+                        val provider = settings.transcriptionProvider
+                        val apiKey = getSelectedProviderApiKey()
+                        if (apiKey.isEmpty()) {
+                            val message = "Transcription skipped: missing ${providerDisplayName(provider)} API key"
+                            Log.w(TAG, message)
+                            WebhookLog.error("$message ($filename)")
+                            updateNotification(message)
+                            skipTranscription = true
+                        } else {
+                            scope.launch(Dispatchers.IO) {
+                                val client = TranscriptionClient(provider, apiKey)
+                                val text = client.transcribe(audioFile)
+                                if (text != null) {
+                                    repository.saveTranscript(text, audioFile)
+                                    Log.d(TAG, "Saved transcript for $filename.")
 
-                val timestamp = SimpleDateFormat("yyyyMMdd_HHmmss", Locale.US).format(Date())
-                val filename = "recording_${timestamp}_$i.m4a"
-                val audioFile = repository.saveEncodedRecording(imaData, filename)
-                Log.d(TAG, "Saved $filename.")
-
-                manager.acknowledgeFile()
-
-                if (!skipTranscription && settings.transcriptionEnabled) {
-                    val provider = settings.transcriptionProvider
-                    val apiKey = getSelectedProviderApiKey()
-                    if (apiKey.isEmpty()) {
-                        val message = "Transcription skipped: missing ${providerDisplayName(provider)} API key"
-                        Log.w(TAG, message)
-                        WebhookLog.error("$message ($filename)")
-                        updateNotification(message)
-                        skipTranscription = true
-                    } else {
-                        scope.launch(Dispatchers.IO) {
-                            val client = TranscriptionClient(provider, apiKey)
-                            val text = client.transcribe(audioFile)
-                            if (text != null) {
-                                repository.saveTranscript(text, audioFile)
-                                Log.d(TAG, "Saved transcript for $filename.")
-
-                                val webhookUrl = settings.webhookUrl.trim()
-                                if (settings.webhookEnabled && webhookUrl.isNotEmpty()) {
-                                    val template = settings.webhookBodyTemplate.ifBlank {
-                                        Settings.DEFAULT_WEBHOOK_BODY_TEMPLATE
-                                    }
-                                    WebhookLog.info("POST $webhookUrl ($filename)")
-                                    val appRetryQueue = (application as MiddleApplication).retryQueue
-                                    try {
-                                        val result = WebhookClient.post(webhookUrl, text, template)
-                                        if (result.success) {
-                                            Log.d(TAG, "Webhook POST succeeded for $filename.")
-                                            WebhookLog.info("${result.code} OK ($filename)")
-                                        } else {
-                                            Log.w(TAG, "Webhook POST failed with status ${result.code} for $filename.")
-                                            WebhookLog.error("${result.code} ${result.message} ($filename): ${result.body}")
-                                            if (result.code !in 400..499) {
-                                                appRetryQueue.enqueue(text, webhookUrl, template, filename)
-                                            }
+                                    val webhookUrl = settings.webhookUrl.trim()
+                                    if (settings.webhookEnabled && webhookUrl.isNotEmpty()) {
+                                        val template = settings.webhookBodyTemplate.ifBlank {
+                                            Settings.DEFAULT_WEBHOOK_BODY_TEMPLATE
                                         }
-                                    } catch (exception: Exception) {
-                                        Log.w(TAG, "Webhook POST error for $filename: $exception")
-                                        WebhookLog.error("$filename: ${exception::class.simpleName}: ${exception.message}")
-                                        appRetryQueue.enqueue(text, webhookUrl, template, filename)
+                                        WebhookLog.info("POST $webhookUrl ($filename)")
+                                        val appRetryQueue = (application as MiddleApplication).retryQueue
+                                        try {
+                                            val result = WebhookClient.post(webhookUrl, text, template)
+                                            if (result.success) {
+                                                Log.d(TAG, "Webhook POST succeeded for $filename.")
+                                                WebhookLog.info("${result.code} OK ($filename)")
+                                            } else {
+                                                Log.w(TAG, "Webhook POST failed with status ${result.code} for $filename.")
+                                                WebhookLog.error("${result.code} ${result.message} ($filename): ${result.body}")
+                                                if (result.code !in 400..499) {
+                                                    appRetryQueue.enqueue(text, webhookUrl, template, filename)
+                                                }
+                                            }
+                                        } catch (exception: Exception) {
+                                            Log.w(TAG, "Webhook POST error for $filename: $exception")
+                                            WebhookLog.error("$filename: ${exception::class.simpleName}: ${exception.message}")
+                                            appRetryQueue.enqueue(text, webhookUrl, template, filename)
+                                        }
                                     }
+                                } else {
+                                    // Disable further transcription attempts this
+                                    // session if the first one fails, same as sync.py.
+                                    val message = "Transcription failed (${providerDisplayName(provider)})"
+                                    Log.w(TAG, message)
+                                    WebhookLog.error("$message ($filename)")
+                                    updateNotification(message)
+                                    skipTranscription = true
                                 }
-                            } else {
-                                // Disable further transcription attempts this
-                                // session if the first one fails, same as sync.py.
-                                val message = "Transcription failed (${providerDisplayName(provider)})"
-                                Log.w(TAG, message)
-                                WebhookLog.error("$message ($filename)")
-                                updateNotification(message)
-                                skipTranscription = true
                             }
                         }
                     }
                 }
-            }
 
-            manager.syncDone()
-            Log.d(TAG, "Sync complete, $fileCount file(s) transferred.")
+                manager.syncDone()
+                Log.d(TAG, "Sync complete, $fileCount file(s) transferred.")
+            } finally {
+                try {
+                    manager.disableAudioNotifications()
+                } catch (exception: Exception) {
+                    Log.w(TAG, "disableAudioNotifications error (connection may be dead): $exception")
+                }
+            }
         } catch (exception: Exception) {
             Log.e(TAG, "Sync failed: $exception")
         } finally {

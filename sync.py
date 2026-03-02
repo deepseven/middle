@@ -42,6 +42,7 @@ CHARACTERISTIC_PAIRING_UUID = "19b10006-e8f2-537e-4f6c-d104768a1214"
 COMMAND_REQUEST_NEXT = bytes([0x01])
 COMMAND_ACK_RECEIVED = bytes([0x02])
 COMMAND_SYNC_DONE = bytes([0x03])
+COMMAND_START_STREAM = bytes([0x04])
 
 SAMPLE_RATE = 16000
 NUMBER_OF_CHANNELS = 1
@@ -54,7 +55,7 @@ OPENAI_API_KEY_ENV_NAME = "OPENAI_API_KEY"
 RECORDINGS_DIRECTORY = Path(__file__).parent / "recordings"
 
 # How often to scan for the pendant.
-SCAN_INTERVAL_SECONDS = 3
+SCAN_INTERVAL_SECONDS = 5
 MAX_FILE_TRANSFER_ATTEMPTS = 3
 TRANSFER_STALL_TIMEOUT_SECONDS = 2.0
 TRANSFER_TOTAL_TIMEOUT_SECONDS = 120.0
@@ -308,6 +309,11 @@ async def sync_recordings(
                 )
                 if received_total_bytes > 0:
                     transfer_progress.update(min(received_total_bytes, expected_size))
+
+                log("Sending START_STREAM command.")
+                await client.write_gatt_char(
+                    CHARACTERISTIC_COMMAND_UUID, COMMAND_START_STREAM
+                )
 
                 while received_total_bytes < expected_size:
                     elapsed = time.monotonic() - transfer_start

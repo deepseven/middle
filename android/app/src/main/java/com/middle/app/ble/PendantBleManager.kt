@@ -14,6 +14,7 @@ import no.nordicsemi.android.ble.ktx.suspend
 import java.io.ByteArrayOutputStream
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
+import java.util.concurrent.atomic.AtomicReference
 
 /**
  * Manages the BLE connection to the Middle pendant and implements the
@@ -27,6 +28,16 @@ class PendantBleManager(context: Context) : BleManager(context) {
     private var commandCharacteristic: BluetoothGattCharacteristic? = null
     private var voltageCharacteristic: BluetoothGattCharacteristic? = null
     private var pairingCharacteristic: BluetoothGattCharacteristic? = null
+
+    // Holds the active transfer state so the notification callback (set once per
+    // session) can write to whichever file is currently being received.
+    private val activeTransfer = AtomicReference<TransferState?>(null)
+
+    private data class TransferState(
+        val buffer: ByteArrayOutputStream,
+        val deferred: CompletableDeferred<ByteArray>,
+        val expectedSize: Int,
+    )
 
     override fun isRequiredServiceSupported(gatt: BluetoothGatt): Boolean {
         val service = gatt.getService(SERVICE_UUID) ?: return false
@@ -54,11 +65,14 @@ class PendantBleManager(context: Context) : BleManager(context) {
     }
 
     override fun initialize() {
-        requestMtu(REQUESTED_MTU).enqueue()
+        // MTU negotiation is done in connectTo() via suspend() so it completes
+        // before any GATT reads/writes. Nothing to do here.
     }
 
     /**
      * Connect to a pendant device with a 10-second timeout, matching sync.py.
+     * MTU negotiation is performed immediately after connection so it completes
+     * before readPairingStatus() or any other GATT operation is called.
      */
     suspend fun connectTo(device: BluetoothDevice) {
         connect(device)
@@ -66,6 +80,7 @@ class PendantBleManager(context: Context) : BleManager(context) {
             .timeout(10_000)
             .useAutoConnect(false)
             .suspend()
+        requestMtu(REQUESTED_MTU).suspend()
     }
 
     /**
@@ -138,17 +153,45 @@ class PendantBleManager(context: Context) : BleManager(context) {
     }
 
     /**
-     * Request and download one file from the pendant. Subscribes to audio
-     * data notifications, sends REQUEST_NEXT, collects chunks until
-     * expectedSize bytes are received, then unsubscribes.
+     * Enables audio data notifications for the session. Must be called once
+     * before the file transfer loop. The notification callback writes to
+     * whichever TransferState is currently active, so it survives across
+     * multiple files without re-toggling the CCCD.
+     */
+    suspend fun enableAudioNotifications() {
+        val audioCharacteristic = audioDataCharacteristic
+            ?: throw IllegalStateException("Not connected or service not discovered.")
+        setNotificationCallback(audioCharacteristic).with { _: BluetoothDevice, data: Data ->
+            val chunk = data.value ?: return@with
+            val state = activeTransfer.get() ?: return@with
+            state.buffer.write(chunk)
+            if (state.expectedSize > 0 && state.buffer.size() >= state.expectedSize) {
+                state.deferred.complete(state.buffer.toByteArray())
+            }
+        }
+        enableNotifications(audioCharacteristic).suspend()
+    }
+
+    /**
+     * Disables audio data notifications. Called once after the file transfer
+     * loop completes (or fails). Errors are swallowed by the caller so a dead
+     * connection does not mask the original failure.
+     */
+    suspend fun disableAudioNotifications() {
+        val audioCharacteristic = audioDataCharacteristic ?: return
+        disableNotifications(audioCharacteristic).suspend()
+    }
+
+    /**
+     * Request and download one file from the pendant. Resets the internal
+     * buffer and deferred for each attempt without toggling CCCD — the
+     * notification subscription is managed at session level by
+     * enableAudioNotifications() / disableAudioNotifications().
      *
      * Returns the raw IMA ADPCM file data (header + payload), or null if
      * the file is empty (corrupt or aborted recording).
      */
     suspend fun requestNextFile(): ByteArray? {
-        val audioCharacteristic = audioDataCharacteristic
-            ?: throw IllegalStateException("Not connected or service not discovered.")
-
         for (attempt in 1..MAX_FILE_TRANSFER_ATTEMPTS) {
             if (attempt > 1) {
                 Log.w(TAG, "Retrying file transfer (attempt $attempt/$MAX_FILE_TRANSFER_ATTEMPTS).")
@@ -156,17 +199,9 @@ class PendantBleManager(context: Context) : BleManager(context) {
 
             val buffer = ByteArrayOutputStream()
             val transferComplete = CompletableDeferred<ByteArray>()
-            var expectedSize = 0
-
-            // Enable notifications before requesting the file.
-            setNotificationCallback(audioCharacteristic).with { _: BluetoothDevice, data: Data ->
-                val chunk = data.value ?: return@with
-                buffer.write(chunk)
-                if (expectedSize > 0 && buffer.size() >= expectedSize) {
-                    transferComplete.complete(buffer.toByteArray())
-                }
-            }
-            enableNotifications(audioCharacteristic).suspend()
+            // Publish the fresh state before sending the command so no chunk
+            // can arrive between the command write and the state swap.
+            activeTransfer.set(TransferState(buffer, transferComplete, 0))
 
             try {
                 writeCommand(COMMAND_REQUEST_NEXT)
@@ -175,7 +210,7 @@ class PendantBleManager(context: Context) : BleManager(context) {
                 // matching the 100ms sleep in sync.py.
                 kotlinx.coroutines.delay(100)
 
-                expectedSize = readFileInfo()
+                val expectedSize = readFileInfo()
                 Log.d(TAG, "Expecting $expectedSize bytes.")
 
                 // Empty files are corrupt or aborted recordings. Return null
@@ -185,20 +220,28 @@ class PendantBleManager(context: Context) : BleManager(context) {
                     return null
                 }
 
-                // If chunks arrived before we read expectedSize, check now.
+                // Update expectedSize in the active state so the callback can
+                // complete the deferred once enough bytes have arrived.
+                activeTransfer.set(TransferState(buffer, transferComplete, expectedSize))
+
+                // If chunks arrived before we updated expectedSize, check now.
                 if (buffer.size() >= expectedSize) {
-                    val result = buffer.toByteArray().copyOfRange(0, expectedSize)
-                    return result
+                    return buffer.toByteArray().copyOfRange(0, expectedSize)
                 }
+
+                // Tell the firmware to begin the notification stream now that
+                // the GATT read of file_info is complete. Sending this before
+                // the read would race notifications against the read response.
+                writeCommand(COMMAND_START_STREAM)
 
                 val result = withTimeout(TRANSFER_TOTAL_TIMEOUT_MILLIS) {
                     transferComplete.await()
                 }
                 return result.copyOfRange(0, expectedSize)
             } catch (exception: TimeoutCancellationException) {
-                Log.w(TAG, "Transfer stalled at ${buffer.size()}/$expectedSize bytes.")
+                Log.w(TAG, "Transfer stalled at ${buffer.size()} bytes.")
             } finally {
-                disableNotifications(audioCharacteristic).suspend()
+                activeTransfer.set(null)
             }
         }
 

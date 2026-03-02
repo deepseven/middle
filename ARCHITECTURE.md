@@ -91,24 +91,27 @@ middle/
 
 | Characteristic | UUID suffix | Properties | Purpose |
 |---|---|---|---|
-| File Count   | `0001` | Read   | Number of pending recordings on flash (uint16 LE) |
-| File Info    | `0002` | Read   | Byte size of the file currently being sent (uint32 LE) |
-| Audio Data   | `0003` | Notify | Chunked IMA ADPCM stream (MTU-sized packets) |
-| Command      | `0004` | Write  | Commands from phone to pendant |
-| Voltage      | `0005` | Read   | Battery millivolts (uint16 LE); optional — older firmware may omit it |
+| File Count   | `0001` | Read        | Number of pending recordings on flash (uint16 LE) |
+| File Info    | `0002` | Read        | Byte size of the file currently being sent (uint32 LE) |
+| Audio Data   | `0003` | Notify      | Chunked IMA ADPCM stream (MTU-sized packets) |
+| Command      | `0004` | Write       | Commands from phone to pendant |
+| Voltage      | `0005` | Read        | Battery millivolts (uint16 LE); optional — older firmware may omit it |
+| Pairing      | `0006` | Read+Write  | Ownership token: read returns 0x00 (unclaimed) or 0x01 (claimed); write sends 16-byte token |
 
-**Commands**: `REQUEST_NEXT=0x01`, `ACK_RECEIVED=0x02`, `SYNC_DONE=0x03`
+**Commands**: `REQUEST_NEXT=0x01`, `ACK_RECEIVED=0x02`, `SYNC_DONE=0x03`, `START_STREAM=0x04`
 
 **MTU**: Firmware requests 517; chunk size = MTU − 3 (ATT header overhead).
 
 **Sync sequence** (per file):
-1. Phone writes `REQUEST_NEXT`.
-2. Phone waits 100 ms, then reads `File Info` for expected byte count.
-3. Firmware streams the file as BLE notifications.
-4. Phone reassembles chunks until `expected_size` bytes received (120 s total timeout).
-5. Phone writes `ACK_RECEIVED`; firmware deletes the file from flash.
-6. Repeat for each file.
-7. Phone writes `SYNC_DONE` when all files are done.
+1. Phone reads `Pairing` characteristic; if pendant is unclaimed (0x00), phone writes a fresh 16-byte random token and stores it + the MAC. If pendant is already claimed (0x01) and the phone has a stored token, phone writes the stored token; firmware disconnects if it doesn't match.
+2. Phone reads `File Count`.
+3. Phone writes `REQUEST_NEXT`; firmware opens the file and sets `File Info` but does not stream yet.
+4. Phone waits 100 ms, then reads `File Info` for expected byte count.
+5. Phone writes `START_STREAM`; firmware begins sending the file as BLE notifications.
+6. Phone reassembles chunks until `expected_size` bytes received (120 s total timeout).
+7. Phone writes `ACK_RECEIVED`; firmware deletes the file from flash.
+8. Repeat for each file.
+9. Phone writes `SYNC_DONE` when all files are done.
 
 **Retry**: up to 3 attempts per file on timeout; firmware retries each notification
 up to 200 times (5 ms delay) on mbuf exhaustion.
@@ -207,7 +210,7 @@ Navigation uses a `ModalNavigationDrawer` (hamburger icon in each screen's top b
 | `android/.../WebhookRetryQueue.kt` | Webhook persistence, exponential backoff, 4xx vs 5xx handling |
 | `android/.../WebhookClient.kt` | OkHttp POST, Basic Auth from URL credentials |
 | `android/.../PendantBleManager.kt` | Nordic BLE manager: scan, connect, sync orchestration |
-| `android/.../SyncForegroundService.kt` | Foreground service keeping BLE sync alive in background |
+| `android/.../SyncForegroundService.kt` | Foreground service: scan loop, pairing handshake, per-file sync, transcription dispatch |
 | `android/.../TranscriptionClient.kt` | OpenAI transcription API calls |
 | `android/.../AudioEncoder.kt` | MediaCodec AAC encoder + MediaMuxer → M4A |
 | `android/.../ImaAdpcmDecoder.kt` | Pure-Kotlin ADPCM decoder (must stay in sync with firmware tables) |
@@ -276,7 +279,10 @@ uv run python -m py_compile sync.py    # syntax check
 - **`backgroundSyncEnabled` setting is stored but not enforced**: `Settings.kt`
   exposes the toggle and `SettingsScreen.kt` renders it, but
   `SyncForegroundService` does not read it — the service always scans regardless
-  of the toggle value.
+  of the toggle value. The scan loop uses `SCAN_MODE_LOW_POWER` (2 s window /
+  9 s period) when the app is backgrounded and `SCAN_MODE_LOW_LATENCY` (2 s
+  window / 3 s period) when foregrounded; these constants live in
+  `BleConstants.kt`.
 - **ExoPlayer dependency is declared but unused**: `media3-exoplayer:1.2.1` is in
   `build.gradle.kts` but playback uses `MediaPlayer` directly in
   `RecordingsViewModel.kt`.
