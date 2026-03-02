@@ -62,6 +62,16 @@ class MainActivity : ComponentActivity() {
         }
     }
 
+    override fun onStart() {
+        super.onStart()
+        AppVisibility.setForeground(true)
+    }
+
+    override fun onStop() {
+        AppVisibility.setForeground(false)
+        super.onStop()
+    }
+
     private fun requestPermissionsAndStart() {
         val needed = mutableListOf<String>()
 

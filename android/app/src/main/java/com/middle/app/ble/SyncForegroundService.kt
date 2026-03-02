@@ -11,6 +11,7 @@ import android.os.IBinder
 import android.os.ParcelUuid
 import android.util.Log
 import androidx.core.app.NotificationCompat
+import com.middle.app.AppVisibility
 import com.middle.app.MiddleApplication
 import com.middle.app.R
 import com.middle.app.data.RecordingsRepository
@@ -33,6 +34,12 @@ import java.util.Date
 import java.util.Locale
 
 class SyncForegroundService : Service() {
+
+    private data class ScanProfile(
+        val scanMode: Int,
+        val windowMillis: Long,
+        val periodMillis: Long,
+    )
 
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Main)
     private var syncJob: Job? = null
@@ -83,11 +90,11 @@ class SyncForegroundService : Service() {
             while (true) {
                 // Skip scan if a sync job is currently active.
                 if (syncJob?.isActive != true) {
-                    startScan()
-                    delay(SCAN_INTERVAL_MILLIS)
+                    val profile = currentScanProfile()
+                    startScan(profile.scanMode)
+                    delay(profile.windowMillis)
                     stopScan()
-                    // Brief pause to let the BT stack release the scanner slot.
-                    delay(500)
+                    delayUntilNextScan(profile)
                 } else {
                     // Sync is active, wait before checking again.
                     delay(500)
@@ -96,7 +103,35 @@ class SyncForegroundService : Service() {
         }
     }
 
-    private fun startScan() {
+    private suspend fun delayUntilNextScan(profile: ScanProfile) {
+        var remaining = profile.periodMillis - profile.windowMillis
+        while (remaining > 0) {
+            if (currentScanProfile() != profile) {
+                return
+            }
+            val step = minOf(remaining, 250L)
+            delay(step)
+            remaining -= step
+        }
+    }
+
+    private fun currentScanProfile(): ScanProfile {
+        if (AppVisibility.isForeground.value) {
+            return ScanProfile(
+                scanMode = ScanSettings.SCAN_MODE_LOW_LATENCY,
+                windowMillis = FOREGROUND_SCAN_WINDOW_MILLIS,
+                periodMillis = FOREGROUND_SCAN_PERIOD_MILLIS,
+            )
+        }
+
+        return ScanProfile(
+            scanMode = ScanSettings.SCAN_MODE_LOW_POWER,
+            windowMillis = BACKGROUND_SCAN_WINDOW_MILLIS,
+            periodMillis = BACKGROUND_SCAN_PERIOD_MILLIS,
+        )
+    }
+
+    private fun startScan(scanMode: Int) {
         val bluetoothManager = getSystemService(BluetoothManager::class.java)
         val adapter = bluetoothManager?.adapter ?: return
         val scanner = adapter.bluetoothLeScanner ?: return
@@ -114,7 +149,7 @@ class SyncForegroundService : Service() {
         }
 
         val scanSettings = ScanSettings.Builder()
-            .setScanMode(ScanSettings.SCAN_MODE_LOW_LATENCY)
+            .setScanMode(scanMode)
             .build()
 
         try {
