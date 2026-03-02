@@ -2,6 +2,7 @@ package com.middle.app.transcription
 
 import android.util.Log
 import com.middle.app.data.Settings
+import com.middle.app.data.WebhookLog
 import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.MultipartBody
 import okhttp3.OkHttpClient
@@ -55,14 +56,17 @@ class TranscriptionClient(
         return try {
             val response = httpClient.newCall(request).execute()
             if (!response.isSuccessful) {
-                Log.e(TAG, "Transcription failed: ${response.code} ${response.body?.string()}")
+                val bodyText = response.body?.string() ?: ""
+                Log.e(TAG, "Transcription failed: ${response.code} $bodyText")
+                WebhookLog.error("Transcription failed (OpenAI): ${response.code} $bodyText")
                 null
             } else {
                 val body = response.body?.string() ?: return null
-                JSONObject(body).getString("text")
+                parseTranscriptText(body, "OpenAI")
             }
         } catch (exception: Exception) {
             Log.e(TAG, "Transcription request failed: $exception")
+            WebhookLog.error("Transcription request failed (OpenAI): ${exception::class.simpleName}: ${exception.message}")
             null
         }
     }
@@ -88,14 +92,39 @@ class TranscriptionClient(
         return try {
             val response = httpClient.newCall(request).execute()
             if (!response.isSuccessful) {
-                Log.e(TAG, "Transcription failed: ${response.code} ${response.body?.string()}")
+                val bodyText = response.body?.string() ?: ""
+                Log.e(TAG, "Transcription failed: ${response.code} $bodyText")
+                WebhookLog.error("Transcription failed (ElevenLabs): ${response.code} $bodyText")
                 null
             } else {
                 val body = response.body?.string() ?: return null
-                JSONObject(body).getString("transcription")
+                parseTranscriptText(body, "ElevenLabs")
             }
         } catch (exception: Exception) {
             Log.e(TAG, "Transcription request failed: $exception")
+            WebhookLog.error("Transcription request failed (ElevenLabs): ${exception::class.simpleName}: ${exception.message}")
+            null
+        }
+    }
+
+    private fun parseTranscriptText(body: String, providerDisplayName: String): String? {
+        return try {
+            val json = JSONObject(body)
+            when {
+                json.has("text") -> json.optString("text")
+                json.has("transcription") -> json.optString("transcription")
+                json.has("transcript") -> json.optString("transcript")
+                else -> {
+                    val message = "Transcription response missing text field ($providerDisplayName): $body"
+                    Log.e(TAG, message)
+                    WebhookLog.error(message)
+                    null
+                }
+            }?.takeIf { it.isNotBlank() }
+        } catch (exception: Exception) {
+            val message = "Transcription response parse failed ($providerDisplayName): ${exception::class.simpleName}: ${exception.message}"
+            Log.e(TAG, "$message. Body: $body")
+            WebhookLog.error(message)
             null
         }
     }

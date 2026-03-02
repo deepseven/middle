@@ -81,6 +81,7 @@ class RecordingsViewModel(application: Application) : AndroidViewModel(applicati
                 val provider = settings.transcriptionProvider
                 val apiKey = getSelectedProviderApiKey()
                 if (apiKey.isEmpty()) {
+                    WebhookLog.error("Transcription skipped: missing ${providerDisplayName(provider)} API key (${recording.audioFile.name})")
                     showToast("Transcription skipped: missing ${providerDisplayName(provider)} API key")
                     return@launch
                 }
@@ -88,6 +89,7 @@ class RecordingsViewModel(application: Application) : AndroidViewModel(applicati
                 val transcribed = TranscriptionClient(provider, apiKey).transcribe(recording.audioFile)
                 if (transcribed == null) {
                     Log.w(TAG, "Transcription failed for ${recording.audioFile.name}, skipping webhook.")
+                    WebhookLog.error("Transcription failed (${providerDisplayName(provider)}) (${recording.audioFile.name})")
                     showToast("Transcription failed (${providerDisplayName(provider)})")
                     return@launch
                 }

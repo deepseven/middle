@@ -270,6 +270,7 @@ class SyncForegroundService : Service() {
                     if (apiKey.isEmpty()) {
                         val message = "Transcription skipped: missing ${providerDisplayName(provider)} API key"
                         Log.w(TAG, message)
+                        WebhookLog.error("$message ($filename)")
                         updateNotification(message)
                         skipTranscription = true
                     } else {
@@ -310,6 +311,7 @@ class SyncForegroundService : Service() {
                                 // session if the first one fails, same as sync.py.
                                 val message = "Transcription failed (${providerDisplayName(provider)})"
                                 Log.w(TAG, message)
+                                WebhookLog.error("$message ($filename)")
                                 updateNotification(message)
                                 skipTranscription = true
                             }
