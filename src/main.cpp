@@ -3,7 +3,13 @@
 #include <BLEServer.h>
 #include <BLEUtils.h>
 #include <LittleFS.h>
+#ifdef BOARD_XIAO_SENSE
+#include <driver/i2s_pdm.h>
+#include <U8g2lib.h>
+#include <Wire.h>
+#else
 #include <driver/i2s_std.h>
+#endif
 #include <driver/rtc_io.h>
 #include <esp_sleep.h>
 // NimBLE API for direct notification calls with congestion retry. The Arduino
@@ -15,6 +21,13 @@
 #include <nvs.h>
 #include <nvs_flash.h>
 
+#ifdef BOARD_XIAO_SENSE
+// XIAO ESP32S3 Sense pin mapping.
+static const int pin_button = 2;   // D1 on XIAO expansion board
+// PDM microphone pins (internal to Sense board).
+static const int pin_pdm_clk = 42;
+static const int pin_pdm_data = 41;
+#else
 static const int pin_button = 2;
 static const int pin_battery = 1;
 static const int pin_mic_power = 10;
@@ -23,6 +36,13 @@ static const int pin_mic_power = 10;
 static const int pin_i2s_sck = 6;
 static const int pin_i2s_ws = 5;
 static const int pin_i2s_sd = 13;
+#endif
+
+// OLED display on the XIAO expansion board (SSD1306 128x64 I2C).
+#ifdef BOARD_XIAO_SENSE
+static U8G2_SSD1306_128X64_NONAME_F_HW_I2C oled(U8G2_R0, U8X8_PIN_NONE);
+static bool oled_ready = false;
+#endif
 
 static const int sample_rate = 16000;
 static const unsigned long minimum_recording_milliseconds = 1000;
@@ -211,6 +231,31 @@ static String normalize_path(const char *name) {
   return String("/") + path;
 }
 
+#ifdef BOARD_XIAO_SENSE
+static void oled_init() {
+  Wire.begin();
+  oled_ready = oled.begin();
+  if (oled_ready) {
+    oled.setFont(u8g2_font_6x10_tr);
+  }
+}
+
+static void oled_show(const char *line1, const char *line2 = nullptr) {
+  if (!oled_ready) return;
+  oled.clearBuffer();
+  if (line1) oled.drawStr(0, 24, line1);
+  if (line2) oled.drawStr(0, 48, line2);
+  oled.sendBuffer();
+}
+
+static void oled_off() {
+  if (!oled_ready) return;
+  oled.clearBuffer();
+  oled.sendBuffer();
+  oled.setPowerSave(1);
+}
+#endif
+
 static void set_status_led_off() {
 #if defined(RGB_BUILTIN)
   rgbLedWrite(RGB_BUILTIN, 0, 0, 0);
@@ -235,6 +280,11 @@ static void start_ble_advertising() {
   if (!ble_advertising->start()) {
     Serial.printf("[ble] advertising start failed\r\n");
   }
+#ifdef BOARD_XIAO_SENSE
+  char buf[22];
+  snprintf(buf, sizeof(buf), "%u file(s)", (unsigned)pending_recording_count);
+  oled_show("BLE Active", buf);
+#endif
 }
 
 // Restarts advertising after a disconnect without touching either sleep timer.
@@ -258,6 +308,9 @@ static void configure_button_wakeup() {
 
 static void enter_deep_sleep() {
   set_status_led_off();
+#ifdef BOARD_XIAO_SENSE
+  oled_off();
+#endif
   if (ble_advertising != nullptr) {
     ble_advertising->stop();
   }
@@ -380,6 +433,43 @@ static const size_t i2s_read_frames = 512;
 
 static i2s_chan_handle_t i2s_rx_channel = nullptr;
 
+#ifdef BOARD_XIAO_SENSE
+static bool i2s_init() {
+  i2s_chan_config_t channel_config = I2S_CHANNEL_DEFAULT_CONFIG(
+      I2S_NUM_AUTO, I2S_ROLE_MASTER);
+  if (i2s_new_channel(&channel_config, nullptr, &i2s_rx_channel) != ESP_OK) {
+    Serial.printf("[rec] i2s_new_channel failed\r\n");
+    return false;
+  }
+
+  i2s_pdm_rx_config_t pdm_config = {
+      .clk_cfg = I2S_PDM_RX_CLK_DEFAULT_CONFIG(sample_rate),
+      .slot_cfg = I2S_PDM_RX_SLOT_DEFAULT_CONFIG(I2S_DATA_BIT_WIDTH_16BIT,
+                                                   I2S_SLOT_MODE_MONO),
+      .gpio_cfg = {
+          .clk = (gpio_num_t)pin_pdm_clk,
+          .din = (gpio_num_t)pin_pdm_data,
+          .invert_flags = {.clk_inv = false},
+      },
+  };
+
+  if (i2s_channel_init_pdm_rx_mode(i2s_rx_channel, &pdm_config) != ESP_OK) {
+    Serial.printf("[rec] i2s_channel_init_pdm_rx_mode failed\r\n");
+    i2s_del_channel(i2s_rx_channel);
+    i2s_rx_channel = nullptr;
+    return false;
+  }
+
+  if (i2s_channel_enable(i2s_rx_channel) != ESP_OK) {
+    Serial.printf("[rec] i2s_channel_enable failed\r\n");
+    i2s_del_channel(i2s_rx_channel);
+    i2s_rx_channel = nullptr;
+    return false;
+  }
+
+  return true;
+}
+#else
 static bool i2s_init() {
   i2s_chan_config_t channel_config = I2S_CHANNEL_DEFAULT_CONFIG(
       I2S_NUM_AUTO, I2S_ROLE_MASTER);
@@ -422,6 +512,7 @@ static bool i2s_init() {
 
   return true;
 }
+#endif
 
 static void i2s_deinit() {
   if (i2s_rx_channel != nullptr) {
@@ -434,10 +525,16 @@ static void i2s_deinit() {
 static bool record_and_save() {
   bool recording_saved = false;
 
+#ifdef BOARD_XIAO_SENSE
+  oled_show("Recording...");
+#else
   digitalWrite(pin_mic_power, HIGH);
+#endif
 
   if (!i2s_init()) {
+#ifndef BOARD_XIAO_SENSE
     digitalWrite(pin_mic_power, LOW);
+#endif
     return false;
   }
 
@@ -475,15 +572,19 @@ static bool record_and_save() {
       break;
     }
 
+#ifdef BOARD_XIAO_SENSE
+    // PDM mode produces 16-bit mono samples directly.
+    static int16_t i2s_buf[i2s_read_frames];
+#else
     // In stereo mode each frame has two 32-bit slots (left + right).
     // The INMP441 outputs 24-bit audio left-justified in the left slot;
     // >> 16 yields a signed 16-bit sample.
     static int32_t i2s_buf[i2s_read_frames * 2];
+#endif
     size_t bytes_read = 0;
 
-    // Discard the first ~100ms of samples to skip the INMP441 startup
-    // transient. In stereo mode each frame is two int32_t values (L+R),
-    // so divide by 2 to count mono samples.
+    // Discard the first ~100ms of samples to skip the microphone startup
+    // transient.
     size_t discarded = 0;
     while (discarded < i2s_startup_discard_samples) {
       esp_err_t err = i2s_channel_read(i2s_rx_channel, i2s_buf, sizeof(i2s_buf),
@@ -492,7 +593,11 @@ static bool record_and_save() {
         Serial.printf("[rec] i2s_channel_read error %d in discard loop\r\n", err);
         break;
       }
+#ifdef BOARD_XIAO_SENSE
+      discarded += bytes_read / sizeof(int16_t);
+#else
       discarded += bytes_read / sizeof(int32_t) / 2;
+#endif
     }
 
     unsigned long record_start_milliseconds = millis();
@@ -511,10 +616,16 @@ static bool record_and_save() {
         break;
       }
 
+#ifdef BOARD_XIAO_SENSE
+      size_t total_samples = bytes_read / sizeof(int16_t);
+      for (size_t i = 0; i < total_samples; i++) {
+        int16_t sample_16 = i2s_buf[i];
+#else
       size_t total_samples = bytes_read / sizeof(int32_t);
       for (size_t i = 0; i < total_samples; i += 2) {
         // Stereo interleave: even indices are left channel (INMP441 data).
         int16_t sample_16 = (int16_t)(i2s_buf[i] >> 16);
+#endif
         uint8_t nibble = adpcm_encode_sample(sample_16, encoder_state);
         sample_count++;
 
@@ -558,7 +669,9 @@ static bool record_and_save() {
   } while (false);
 
   i2s_deinit();
+#ifndef BOARD_XIAO_SENSE
   digitalWrite(pin_mic_power, LOW);
+#endif
   return recording_saved;
 }
 
@@ -654,6 +767,12 @@ static void stream_prepared_file() {
 }
 
 static uint16_t read_battery_millivolts() {
+#ifdef BOARD_XIAO_SENSE
+  // The XIAO ESP32S3 does not expose battery voltage to any GPIO. No pin
+  // has an on-board voltage divider connected to the battery. Measuring
+  // the battery would require external wiring.
+  return 0;
+#else
   // Throwaway read to pre-charge the ADC's sample-and-hold capacitor,
   // which otherwise doesn't fully settle through the 180k voltage divider.
   analogRead(pin_battery);
@@ -669,6 +788,7 @@ static uint16_t read_battery_millivolts() {
   uint32_t raw = (sum / 10) * 2;
   uint32_t factor = 13020 - 65 * raw / 100;
   return (uint16_t)(raw * factor / 10000);
+#endif
 }
 
 static const size_t pairing_token_length = 16;
@@ -853,8 +973,12 @@ void setup() {
   set_status_led_off();
 
   pinMode(pin_button, INPUT_PULLUP);
+#ifdef BOARD_XIAO_SENSE
+  oled_init();
+#else
   pinMode(pin_mic_power, OUTPUT);
   digitalWrite(pin_mic_power, LOW);
+#endif
 
   // NVS must be initialized before any NVS reads, including the pairing token
   // check in init_ble(). nvs_flash_init() is safe to call on every boot.
@@ -905,6 +1029,11 @@ void loop() {
       prepare_current_file();
     } else if (command == command_start_stream) {
       stream_prepared_file();
+#ifdef BOARD_XIAO_SENSE
+      char sync_buf[22];
+      snprintf(sync_buf, sizeof(sync_buf), "%u left", (unsigned)pending_recording_count);
+      oled_show("Syncing...", sync_buf);
+#endif
     } else if (command == command_ack_received) {
       String path_to_delete = current_stream_path;
       if (path_to_delete.length() == 0) {
