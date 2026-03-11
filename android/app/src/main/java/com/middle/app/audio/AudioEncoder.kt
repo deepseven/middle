@@ -4,6 +4,7 @@ import android.media.MediaCodec
 import android.media.MediaCodecInfo
 import android.media.MediaFormat
 import android.media.MediaMuxer
+import android.util.Log
 import java.io.File
 import java.nio.ByteBuffer
 
@@ -103,6 +104,10 @@ object AudioEncoder {
      */
     fun encodeFromIma(imaFileData: ByteArray, outputFile: File) {
         val pcm16 = ImaAdpcmDecoder.decodeFile(imaFileData)
+        Log.d(TAG, "[SyncDebug] decodeFile() produced ${pcm16.size} PCM bytes.")
         encodeToM4a(pcm16, outputFile)
+        Log.d(TAG, "[SyncDebug] encodeToM4a() wrote ${outputFile.length()} bytes to ${outputFile.absolutePath}.")
     }
+
+    private const val TAG = "AudioEncoder"
 }

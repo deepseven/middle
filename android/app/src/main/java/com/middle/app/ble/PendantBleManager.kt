@@ -233,13 +233,16 @@ class PendantBleManager(context: Context) : BleManager(context) {
                 // the GATT read of file_info is complete. Sending this before
                 // the read would race notifications against the read response.
                 writeCommand(COMMAND_START_STREAM)
+                Log.d(TAG, "[SyncDebug] START_STREAM sent.")
 
                 val result = withTimeout(TRANSFER_TOTAL_TIMEOUT_MILLIS) {
                     transferComplete.await()
                 }
+                Log.d(TAG, "[SyncDebug] transferComplete.await() returned ${result.size} bytes received.")
                 return result.copyOfRange(0, expectedSize)
             } catch (exception: TimeoutCancellationException) {
-                Log.w(TAG, "Transfer stalled at ${buffer.size()} bytes.")
+                val expectedSize = activeTransfer.get()?.expectedSize ?: 0
+                Log.w(TAG, "[SyncDebug] Transfer timed out: received ${buffer.size()} of $expectedSize bytes.")
             } finally {
                 activeTransfer.set(null)
             }
@@ -251,7 +254,9 @@ class PendantBleManager(context: Context) : BleManager(context) {
     }
 
     suspend fun acknowledgeFile() {
+        Log.d(TAG, "[SyncDebug] Sending ACK_RECEIVED command.")
         writeCommand(COMMAND_ACK_RECEIVED)
+        Log.d(TAG, "[SyncDebug] ACK_RECEIVED command written successfully.")
     }
 
     suspend fun syncDone() {

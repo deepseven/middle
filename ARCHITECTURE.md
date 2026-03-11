@@ -204,9 +204,9 @@ Navigation uses a `ModalNavigationDrawer` (hamburger icon in each screen's top b
 | Path | Reason |
 |---|---|
 | `src/main.cpp` | Entire firmware: recording, BLE server, ADPCM encoder, notification retry |
-| `src/main.cpp:send_notification()` (line 544) | NimBLE notification retry loop (up to 200 attempts, 5 ms delay) |
-| `src/main.cpp:record_and_save()` (line 412) | I2S capture, ring buffer, FreeRTOS writer task, ADPCM encoding |
-| `sync.py:sync_recordings()` (line 171) | BLE transfer loop with per-file retry (`MAX_FILE_TRANSFER_ATTEMPTS=3`) and stall/total timeouts |
+| `src/main.cpp:send_notification()` (line 570) | NimBLE notification retry loop (up to 200 attempts, 5 ms delay) |
+| `src/main.cpp:record_and_save()` (line 434) | I2S capture, ring buffer, FreeRTOS writer task, ADPCM encoding |
+| `sync.py:sync_recordings()` (line 210) | BLE transfer loop with per-file retry (`MAX_FILE_TRANSFER_ATTEMPTS=3`) and stall/total timeouts |
 | `android/.../WebhookRetryQueue.kt` | Webhook persistence, exponential backoff, 4xx vs 5xx handling |
 | `android/.../WebhookClient.kt` | OkHttp POST, Basic Auth from URL credentials |
 | `android/.../PendantBleManager.kt` | Nordic BLE manager: scan, connect, sync orchestration |

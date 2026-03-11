@@ -15,6 +15,14 @@
 #include <nvs.h>
 #include <nvs_flash.h>
 
+#define DEBUG 0
+
+#if DEBUG
+  #define DBG(...) Serial.printf(__VA_ARGS__)
+#else
+  #define DBG(...)
+#endif
+
 static const int pin_button = 2;
 static const int pin_battery = 1;
 static const int pin_mic_power = 10;
@@ -178,6 +186,7 @@ static const uint8_t command_request_next = 0x01;
 static const uint8_t command_ack_received = 0x02;
 static const uint8_t command_sync_done = 0x03;
 static const uint8_t command_start_stream = 0x04;
+
 static const unsigned long ble_keepalive_milliseconds = 10000;
 
 static BLEServer *ble_server = nullptr;
@@ -188,7 +197,37 @@ static BLECharacteristic *voltage_characteristic = nullptr;
 static BLECharacteristic *pairing_characteristic = nullptr;
 static BLEAdvertising *ble_advertising = nullptr;
 
-static volatile uint8_t pending_command = 0;
+// Lock-free single-producer (BLE callback) single-consumer (loop()) command
+// queue. Replaces the old single-byte pending_command which silently dropped
+// commands when a new one arrived before the previous was processed.
+static const size_t command_queue_capacity = 8;
+static volatile uint8_t command_queue[command_queue_capacity];
+static volatile size_t command_queue_head = 0;
+static volatile size_t command_queue_tail = 0;
+
+static void command_queue_push(uint8_t command) {
+  size_t next_tail = (command_queue_tail + 1) % command_queue_capacity;
+  if (next_tail == command_queue_head) {
+    return;
+  }
+  command_queue[command_queue_tail] = command;
+  command_queue_tail = next_tail;
+}
+
+// Returns the next command, or 0 if the queue is empty.
+static uint8_t command_queue_pop() {
+  if (command_queue_head == command_queue_tail) {
+    return 0;
+  }
+  uint8_t command = command_queue[command_queue_head];
+  command_queue_head = (command_queue_head + 1) % command_queue_capacity;
+  return command;
+}
+
+static void command_queue_clear() {
+  command_queue_head = 0;
+  command_queue_tail = 0;
+}
 static volatile bool client_connected = false;
 static volatile bool connection_authenticated = false;
 static volatile uint16_t pending_recording_count = 0;
@@ -233,7 +272,7 @@ static void start_ble_advertising() {
   ble_active_until_milliseconds = millis() + ble_keepalive_milliseconds;
   hard_sleep_deadline_milliseconds = millis() + 30000;
   if (!ble_advertising->start()) {
-    Serial.printf("[ble] advertising start failed\r\n");
+    DBG("[ble] advertising start failed\r\n");
   }
 }
 
@@ -246,7 +285,7 @@ static void resume_ble_advertising() {
     return;
   }
   if (!ble_advertising->start()) {
-    Serial.printf("[ble] advertising resume failed\r\n");
+    DBG("[ble] advertising resume failed\r\n");
   }
 }
 
@@ -325,6 +364,32 @@ static long next_recording_id() {
   return max_id + 1;
 }
 
+// Remove any 0-byte recording files left behind by failed writes or
+// filesystem corruption. These zombie files can't be streamed or deleted
+// during normal sync, so they cause the transfer loop to repeat forever.
+static void remove_empty_recordings() {
+  if (!ensure_littlefs_ready()) {
+    return;
+  }
+
+  File root = LittleFS.open("/");
+  File entry = root.openNextFile();
+  // Collect paths first — modifying the filesystem while iterating is unsafe.
+  String to_remove[32];
+  int remove_count = 0;
+  while (entry && remove_count < 32) {
+    String name = String(entry.name());
+    if (parse_recording_id(name) >= 0 && entry.size() == 0) {
+      to_remove[remove_count++] = normalize_path(entry.name());
+    }
+    entry = root.openNextFile();
+  }
+
+  for (int i = 0; i < remove_count; i++) {
+    LittleFS.remove(to_remove[i]);
+  }
+}
+
 static int count_recordings() {
   if (!ensure_littlefs_ready()) {
     return 0;
@@ -384,7 +449,7 @@ static bool i2s_init() {
   i2s_chan_config_t channel_config = I2S_CHANNEL_DEFAULT_CONFIG(
       I2S_NUM_AUTO, I2S_ROLE_MASTER);
   if (i2s_new_channel(&channel_config, nullptr, &i2s_rx_channel) != ESP_OK) {
-    Serial.printf("[rec] i2s_new_channel failed\r\n");
+    DBG("[rec] i2s_new_channel failed\r\n");
     return false;
   }
 
@@ -407,14 +472,14 @@ static bool i2s_init() {
   };
 
   if (i2s_channel_init_std_mode(i2s_rx_channel, &std_config) != ESP_OK) {
-    Serial.printf("[rec] i2s_channel_init_std_mode failed\r\n");
+    DBG("[rec] i2s_channel_init_std_mode failed\r\n");
     i2s_del_channel(i2s_rx_channel);
     i2s_rx_channel = nullptr;
     return false;
   }
 
   if (i2s_channel_enable(i2s_rx_channel) != ESP_OK) {
-    Serial.printf("[rec] i2s_channel_enable failed\r\n");
+    DBG("[rec] i2s_channel_enable failed\r\n");
     i2s_del_channel(i2s_rx_channel);
     i2s_rx_channel = nullptr;
     return false;
@@ -489,7 +554,7 @@ static bool record_and_save() {
       esp_err_t err = i2s_channel_read(i2s_rx_channel, i2s_buf, sizeof(i2s_buf),
                                        &bytes_read, portMAX_DELAY);
       if (err != ESP_OK) {
-        Serial.printf("[rec] i2s_channel_read error %d in discard loop\r\n", err);
+        DBG("[rec] i2s_channel_read error %d in discard loop\r\n", err);
         break;
       }
       discarded += bytes_read / sizeof(int32_t) / 2;
@@ -507,7 +572,7 @@ static bool record_and_save() {
                                        sizeof(i2s_buf), &bytes_read,
                                        portMAX_DELAY);
       if (err != ESP_OK) {
-        Serial.printf("[rec] i2s_channel_read error %d\r\n", err);
+        DBG("[rec] i2s_channel_read error %d\r\n", err);
         break;
       }
 
@@ -620,7 +685,7 @@ static void prepare_current_file() {
 // then closes the file handle. No-op if no file was prepared.
 static void stream_prepared_file() {
   if (!pending_stream_file) {
-    Serial.printf("[ble] stream_prepared_file called with no prepared file\r\n");
+    DBG("[ble] stream_prepared_file called with no prepared file\r\n");
     return;
   }
 
@@ -684,7 +749,7 @@ static bool nvs_read_pair_token(uint8_t out_token[pairing_token_length]) {
     return false;
   }
   if (err != ESP_OK) {
-    Serial.printf("[ble] nvs_open read failed: %d\r\n", err);
+    DBG("[ble] nvs_open read failed: %d\r\n", err);
     return false;
   }
   size_t length = pairing_token_length;
@@ -694,7 +759,7 @@ static bool nvs_read_pair_token(uint8_t out_token[pairing_token_length]) {
     return false;
   }
   if (err != ESP_OK || length != pairing_token_length) {
-    Serial.printf("[ble] nvs_get_blob failed: %d\r\n", err);
+    DBG("[ble] nvs_get_blob failed: %d\r\n", err);
     return false;
   }
   return true;
@@ -705,7 +770,7 @@ static bool nvs_write_pair_token(const uint8_t token[pairing_token_length]) {
   nvs_handle_t handle;
   esp_err_t err = nvs_open(nvs_namespace, NVS_READWRITE, &handle);
   if (err != ESP_OK) {
-    Serial.printf("[ble] nvs_open write failed: %d\r\n", err);
+    DBG("[ble] nvs_open write failed: %d\r\n", err);
     return false;
   }
   err = nvs_set_blob(handle, nvs_key_pair_token, token, pairing_token_length);
@@ -714,7 +779,7 @@ static bool nvs_write_pair_token(const uint8_t token[pairing_token_length]) {
   }
   nvs_close(handle);
   if (err != ESP_OK) {
-    Serial.printf("[ble] nvs_set_blob/commit failed: %d\r\n", err);
+    DBG("[ble] nvs_set_blob/commit failed: %d\r\n", err);
     return false;
   }
   return true;
@@ -728,7 +793,7 @@ class server_callbacks : public BLEServerCallbacks {
   void onDisconnect(BLEServer *server) override {
     client_connected = false;
     connection_authenticated = false;
-    pending_command = 0;
+    command_queue_clear();
     if (pending_stream_file) {
       pending_stream_file.close();
     }
@@ -744,7 +809,7 @@ class command_callbacks : public BLECharacteristicCallbacks {
   void onWrite(BLECharacteristic *characteristic) override {
     String value = characteristic->getValue();
     if (value.length() > 0) {
-      pending_command = (uint8_t)value[0];
+      command_queue_push((uint8_t)value[0]);
     }
   }
 };
@@ -759,8 +824,8 @@ class pairing_callbacks : public BLECharacteristicCallbacks {
   void onWrite(BLECharacteristic *characteristic) override {
     String value = characteristic->getValue();
     if ((size_t)value.length() != pairing_token_length) {
-      Serial.printf("[ble] pairing write wrong length %d, disconnecting\r\n",
-                    value.length());
+      DBG("[ble] pairing write wrong length %d, disconnecting\r\n",
+          value.length());
       ble_server->disconnect(ble_server->getConnId());
       return;
     }
@@ -775,17 +840,17 @@ class pairing_callbacks : public BLECharacteristicCallbacks {
         ble_server->disconnect(ble_server->getConnId());
         return;
       }
-      Serial.printf("[ble] paired with new token\r\n");
+      DBG("[ble] paired with new token\r\n");
       connection_authenticated = true;
       ble_active_until_milliseconds = millis() + ble_keepalive_milliseconds;
       hard_sleep_deadline_milliseconds = millis() + 30000;
     } else {
       if (memcmp(written_token, stored_token, pairing_token_length) != 0) {
-        Serial.printf("[ble] token mismatch, disconnecting\r\n");
+        DBG("[ble] token mismatch, disconnecting\r\n");
         ble_server->disconnect(ble_server->getConnId());
         return;
       }
-      Serial.printf("[ble] token verified\r\n");
+      DBG("[ble] token verified\r\n");
       connection_authenticated = true;
       ble_active_until_milliseconds = millis() + ble_keepalive_milliseconds;
       hard_sleep_deadline_milliseconds = millis() + 30000;
@@ -844,13 +909,17 @@ static void start_ble_if_needed() {
     }
     uint16_t millivolts = read_battery_millivolts();
     voltage_characteristic->setValue(millivolts);
-    Serial.printf("[bat] Battery: %u mV\r\n", millivolts);
+    DBG("[bat] Battery: %u mV\r\n", millivolts);
     start_ble_advertising();
   }
 }
 
 void setup() {
   set_status_led_off();
+
+#if DEBUG
+  Serial.begin(115200);
+#endif
 
   pinMode(pin_button, INPUT_PULLUP);
   pinMode(pin_mic_power, OUTPUT);
@@ -867,6 +936,8 @@ void setup() {
       wakeup_cause != ESP_SLEEP_WAKEUP_EXT1) {
     enter_deep_sleep();
   }
+
+  remove_empty_recordings();
 
   int button = digitalRead(pin_button);
   if (button == LOW) {
@@ -895,29 +966,40 @@ void loop() {
     }
   }
 
-  if (pending_command != 0) {
-    uint8_t command = pending_command;
-    pending_command = 0;
-
+  uint8_t command;
+  while ((command = command_queue_pop()) != 0) {
     if (!connection_authenticated) {
-      Serial.printf("[ble] command rejected, not authenticated\r\n");
+      DBG("[ble] command rejected, not authenticated\r\n");
     } else if (command == command_request_next) {
       prepare_current_file();
     } else if (command == command_start_stream) {
       stream_prepared_file();
     } else if (command == command_ack_received) {
+
+      // Close any file handle left open by prepare_current_file(). When the
+      // client skips START_STREAM (e.g. because the file was 0 bytes),
+      // stream_prepared_file() is never called and the handle leaks — which
+      // prevents LittleFS.remove() from deleting the file.
+      if (pending_stream_file) {
+        pending_stream_file.close();
+      }
+
       String path_to_delete = current_stream_path;
       if (path_to_delete.length() == 0) {
         path_to_delete = next_recording_path();
       }
 
-      if (path_to_delete.length() > 0) {
+      if (path_to_delete.length() == 0) {
+      } else {
         bool removed = LittleFS.remove(path_to_delete);
+        DBG("[ble] remove %s: %s\r\n",
+            path_to_delete.c_str(), removed ? "OK" : "FAILED");
         if (removed) {
           current_stream_path = "";
         }
       }
       update_file_count();
+    } else if (command == command_sync_done) {
     }
   }
 
@@ -927,7 +1009,7 @@ void loop() {
   }
 
   if (sleep_requested ||
-      (!client_connected && pending_command == 0 && button_state == HIGH &&
+      (!client_connected && command_queue_head == command_queue_tail && button_state == HIGH &&
        !ble_window_active())) {
     sleep_requested = false;
     enter_deep_sleep();

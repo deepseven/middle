@@ -232,7 +232,7 @@ class SyncForegroundService : Service() {
 
             updateNotification(getString(R.string.sync_notification_syncing))
             val fileCount = manager.readFileCount()
-            Log.d(TAG, "Pendant reports $fileCount pending recording(s).")
+            Log.d(TAG, "[SyncDebug] readFileCount() returned $fileCount.")
 
             if (fileCount == 0) {
                 manager.syncDone()
@@ -250,24 +250,25 @@ class SyncForegroundService : Service() {
                     updateNotification("Syncing file ${i + 1}/$fileCount...")
 
                     val imaData = manager.requestNextFile()
+                    Log.d(TAG, "[SyncDebug] requestNextFile() returned ${if (imaData == null) "null" else "${imaData.size} bytes"}.")
 
                     // Empty files are corrupt or aborted recordings. ACK to delete
                     // them from the pendant and continue to the next file.
                     if (imaData == null) {
-                        Log.d(TAG, "Skipping empty file ${i + 1}/$fileCount.")
+                        Log.d(TAG, "[SyncDebug] Skipping empty file ${i + 1}/$fileCount, sending ACK.")
                         manager.acknowledgeFile()
+                        Log.d(TAG, "[SyncDebug] ACK sent for empty file ${i + 1}/$fileCount.")
                         delay(300)
                         continue
                     }
 
-                    Log.d(TAG, "Received ${imaData.size} bytes.")
-
                     val timestamp = SimpleDateFormat("yyyyMMdd_HHmmss", Locale.US).format(Date())
                     val filename = "recording_${timestamp}_$i.m4a"
                     val audioFile = repository.saveEncodedRecording(imaData, filename)
-                    Log.d(TAG, "Saved $filename.")
+                    Log.d(TAG, "[SyncDebug] saveEncodedRecording() returned path=${audioFile.absolutePath} size=${audioFile.length()} bytes.")
 
                     manager.acknowledgeFile()
+                    Log.d(TAG, "[SyncDebug] ACK sent for file ${i + 1}/$fileCount.")
                     // Brief pause between files to let the pendant settle before
                     // the next COMMAND_REQUEST_NEXT, reducing GATT instability.
                     delay(300)
@@ -328,8 +329,10 @@ class SyncForegroundService : Service() {
                     }
                 }
 
+                val remainingFileCount = manager.readFileCount()
+                Log.d(TAG, "[SyncDebug] Post-loop readFileCount() returned $remainingFileCount (expected 0 if all ACKs were processed).")
                 manager.syncDone()
-                Log.d(TAG, "Sync complete, $fileCount file(s) transferred.")
+                Log.d(TAG, "[SyncDebug] Sync complete, $fileCount file(s) transferred.")
             } finally {
                 try {
                     manager.disableAudioNotifications()
@@ -338,7 +341,7 @@ class SyncForegroundService : Service() {
                 }
             }
         } catch (exception: Exception) {
-            Log.e(TAG, "Sync failed: $exception")
+            Log.e(TAG, "[SyncDebug] Sync failed.", exception)
         } finally {
             try {
                 manager.disconnect().enqueue()
