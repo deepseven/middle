@@ -15,6 +15,7 @@ import java.util.concurrent.TimeUnit
 class TranscriptionClient(
     private val provider: String,
     private val apiKey: String,
+    private val customUrl: String = "",
 ) {
 
     private val httpClient = OkHttpClient.Builder()
@@ -27,6 +28,7 @@ class TranscriptionClient(
         return when (provider) {
             Settings.TRANSCRIPTION_PROVIDER_OPENAI -> transcribeOpenAi(audioFile)
             Settings.TRANSCRIPTION_PROVIDER_ELEVENLABS -> transcribeElevenLabs(audioFile)
+            Settings.TRANSCRIPTION_PROVIDER_CUSTOM -> transcribeCustom(audioFile)
             else -> {
                 Log.e(TAG, "Unsupported transcription provider: $provider")
                 null
@@ -103,6 +105,48 @@ class TranscriptionClient(
         } catch (exception: Exception) {
             Log.e(TAG, "Transcription request failed: $exception")
             WebhookLog.error("Transcription request failed (ElevenLabs): ${exception::class.simpleName}: ${exception.message}")
+            null
+        }
+    }
+
+    private fun transcribeCustom(audioFile: File): String? {
+        if (customUrl.isBlank()) {
+            Log.e(TAG, "Custom STT URL is empty")
+            WebhookLog.error("Transcription failed (Custom): URL not configured")
+            return null
+        }
+
+        val mimeType = "audio/mp4"
+        val bodyBuilder = MultipartBody.Builder()
+            .setType(MultipartBody.FORM)
+            .addFormDataPart(
+                "file",
+                audioFile.name,
+                audioFile.asRequestBody(mimeType.toMediaType()),
+            )
+
+        val requestBuilder = Request.Builder()
+            .url(customUrl)
+            .post(bodyBuilder.build())
+
+        if (apiKey.isNotEmpty()) {
+            requestBuilder.header("Authorization", "Bearer $apiKey")
+        }
+
+        return try {
+            val response = httpClient.newCall(requestBuilder.build()).execute()
+            if (!response.isSuccessful) {
+                val bodyText = response.body?.string() ?: ""
+                Log.e(TAG, "Transcription failed: ${response.code} $bodyText")
+                WebhookLog.error("Transcription failed (Custom): ${response.code} $bodyText")
+                null
+            } else {
+                val body = response.body?.string() ?: return null
+                parseTranscriptText(body, "Custom")
+            }
+        } catch (exception: Exception) {
+            Log.e(TAG, "Transcription request failed: $exception")
+            WebhookLog.error("Transcription request failed (Custom): ${exception::class.simpleName}: ${exception.message}")
             null
         }
     }

@@ -19,6 +19,12 @@ class SettingsViewModel(application: Application) : AndroidViewModel(application
     private val _transcriptionProvider = MutableStateFlow(settings.transcriptionProvider)
     val transcriptionProvider: StateFlow<String> = _transcriptionProvider
 
+    private val _customSttUrl = MutableStateFlow(settings.customSttUrl)
+    val customSttUrl: StateFlow<String> = _customSttUrl
+
+    private val _customSttApiKey = MutableStateFlow(settings.customSttApiKey)
+    val customSttApiKey: StateFlow<String> = _customSttApiKey
+
     private val _backgroundSyncEnabled = MutableStateFlow(settings.backgroundSyncEnabled)
     val backgroundSyncEnabled: StateFlow<Boolean> = _backgroundSyncEnabled
 
@@ -53,6 +59,16 @@ class SettingsViewModel(application: Application) : AndroidViewModel(application
     fun setTranscriptionProvider(provider: String) {
         settings.transcriptionProvider = provider
         _transcriptionProvider.value = provider
+    }
+
+    fun setCustomSttUrl(url: String) {
+        settings.customSttUrl = url
+        _customSttUrl.value = url
+    }
+
+    fun setCustomSttApiKey(key: String) {
+        settings.customSttApiKey = key
+        _customSttApiKey.value = key
     }
 
     fun setBackgroundSync(enabled: Boolean) {

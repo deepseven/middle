@@ -68,7 +68,10 @@ class RecordingsViewModel(application: Application) : AndroidViewModel(applicati
         get() = settings.webhookEnabled && settings.webhookUrl.trim().isNotEmpty()
 
     val transcriptionAvailable: Boolean
-        get() = settings.transcriptionEnabled && getSelectedProviderApiKey().isNotEmpty()
+        get() = settings.transcriptionEnabled && when (settings.transcriptionProvider) {
+            Settings.TRANSCRIPTION_PROVIDER_CUSTOM -> settings.customSttUrl.isNotBlank()
+            else -> getSelectedProviderApiKey().isNotEmpty()
+        }
 
     fun sendWebhook(recording: Recording) {
         val webhookUrl = settings.webhookUrl.trim()
@@ -86,7 +89,7 @@ class RecordingsViewModel(application: Application) : AndroidViewModel(applicati
                     return@launch
                 }
 
-                val transcribed = TranscriptionClient(provider, apiKey).transcribe(recording.audioFile)
+                val transcribed = TranscriptionClient(provider, apiKey, settings.customSttUrl.trim()).transcribe(recording.audioFile)
                 if (transcribed == null) {
                     Log.w(TAG, "Transcription failed for ${recording.audioFile.name}, skipping webhook.")
                     WebhookLog.error("Transcription failed (${providerDisplayName(provider)}) (${recording.audioFile.name})")
@@ -165,6 +168,7 @@ class RecordingsViewModel(application: Application) : AndroidViewModel(applicati
         return when (settings.transcriptionProvider) {
             Settings.TRANSCRIPTION_PROVIDER_OPENAI -> settings.openAiApiKey.trim()
             Settings.TRANSCRIPTION_PROVIDER_ELEVENLABS -> settings.elevenLabsApiKey.trim()
+            Settings.TRANSCRIPTION_PROVIDER_CUSTOM -> settings.customSttApiKey.trim()
             else -> ""
         }
     }
@@ -173,6 +177,7 @@ class RecordingsViewModel(application: Application) : AndroidViewModel(applicati
         return when (provider) {
             Settings.TRANSCRIPTION_PROVIDER_OPENAI -> "OpenAI"
             Settings.TRANSCRIPTION_PROVIDER_ELEVENLABS -> "ElevenLabs"
+            Settings.TRANSCRIPTION_PROVIDER_CUSTOM -> "Custom"
             else -> provider
         }
     }

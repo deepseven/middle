@@ -47,6 +47,8 @@ fun SettingsScreen(
     val transcriptionProvider by viewModel.transcriptionProvider.collectAsState()
     val openAiApiKey by viewModel.openAiApiKey.collectAsState()
     val elevenLabsApiKey by viewModel.elevenLabsApiKey.collectAsState()
+    val customSttUrl by viewModel.customSttUrl.collectAsState()
+    val customSttApiKey by viewModel.customSttApiKey.collectAsState()
     val backgroundSync by viewModel.backgroundSyncEnabled.collectAsState()
     val transcription by viewModel.transcriptionEnabled.collectAsState()
     val webhookEnabled by viewModel.webhookEnabled.collectAsState()
@@ -57,14 +59,8 @@ fun SettingsScreen(
     var showUnpairDialog by remember { mutableStateOf(false) }
 
     val isOpenAiProvider = transcriptionProvider == Settings.TRANSCRIPTION_PROVIDER_OPENAI
-    val apiKey = if (isOpenAiProvider) openAiApiKey else elevenLabsApiKey
-    val apiKeyLabel = if (isOpenAiProvider) "OpenAI API key" else "ElevenLabs API key"
-    val apiKeyPlaceholder = if (isOpenAiProvider) "sk-..." else "xi-..."
-    val apiKeyHelp = if (isOpenAiProvider) {
-        "Create an API key in your OpenAI account settings."
-    } else {
-        "Create an API key in your ElevenLabs profile settings."
-    }
+    val isElevenLabsProvider = transcriptionProvider == Settings.TRANSCRIPTION_PROVIDER_ELEVENLABS
+    val isCustomProvider = transcriptionProvider == Settings.TRANSCRIPTION_PROVIDER_CUSTOM
 
     Scaffold(
         topBar = {
@@ -97,42 +93,98 @@ fun SettingsScreen(
                 Text("OpenAI")
                 Spacer(modifier = Modifier.weight(1f))
                 RadioButton(
-                    selected = !isOpenAiProvider,
+                    selected = isElevenLabsProvider,
                     onClick = { viewModel.setTranscriptionProvider(Settings.TRANSCRIPTION_PROVIDER_ELEVENLABS) },
                 )
                 Text("ElevenLabs")
+                Spacer(modifier = Modifier.weight(1f))
+                RadioButton(
+                    selected = isCustomProvider,
+                    onClick = { viewModel.setTranscriptionProvider(Settings.TRANSCRIPTION_PROVIDER_CUSTOM) },
+                )
+                Text("Custom")
             }
 
             Spacer(modifier = Modifier.height(16.dp))
 
-            Text(apiKeyLabel, style = MaterialTheme.typography.titleSmall)
-            Spacer(modifier = Modifier.height(4.dp))
-            OutlinedTextField(
-                value = apiKey,
-                onValueChange = {
-                    if (isOpenAiProvider) {
-                        viewModel.setOpenAiApiKey(it)
-                    } else {
-                        viewModel.setElevenLabsApiKey(it)
-                    }
-                },
-                modifier = Modifier.fillMaxWidth(),
-                singleLine = true,
-                visualTransformation = PasswordVisualTransformation(),
-                placeholder = { Text(apiKeyPlaceholder) },
-            )
-            Spacer(modifier = Modifier.height(4.dp))
-            Text(
-                text = apiKeyHelp,
-                style = MaterialTheme.typography.bodySmall,
-            )
-            if (transcription && apiKey.isBlank()) {
+            if (isCustomProvider) {
+                Text("Endpoint URL", style = MaterialTheme.typography.titleSmall)
+                Spacer(modifier = Modifier.height(4.dp))
+                OutlinedTextField(
+                    value = customSttUrl,
+                    onValueChange = { viewModel.setCustomSttUrl(it) },
+                    modifier = Modifier.fillMaxWidth(),
+                    singleLine = true,
+                    placeholder = { Text("https://your-server/v1/audio/transcriptions") },
+                )
                 Spacer(modifier = Modifier.height(4.dp))
                 Text(
-                    text = "Automatic transcription is enabled, but this provider has no API key.",
+                    text = "Whisper-compatible endpoint. POST multipart with a \"file\" field, returns JSON with a \"text\" field.",
                     style = MaterialTheme.typography.bodySmall,
-                    color = MaterialTheme.colorScheme.error,
                 )
+                Spacer(modifier = Modifier.height(12.dp))
+                Text("API key (optional)", style = MaterialTheme.typography.titleSmall)
+                Spacer(modifier = Modifier.height(4.dp))
+                OutlinedTextField(
+                    value = customSttApiKey,
+                    onValueChange = { viewModel.setCustomSttApiKey(it) },
+                    modifier = Modifier.fillMaxWidth(),
+                    singleLine = true,
+                    visualTransformation = PasswordVisualTransformation(),
+                    placeholder = { Text("Bearer token") },
+                )
+                Spacer(modifier = Modifier.height(4.dp))
+                Text(
+                    text = "Sent as Authorization: Bearer header. Leave blank if not needed.",
+                    style = MaterialTheme.typography.bodySmall,
+                )
+                if (transcription && customSttUrl.isBlank()) {
+                    Spacer(modifier = Modifier.height(4.dp))
+                    Text(
+                        text = "Automatic transcription is enabled, but no endpoint URL is configured.",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.error,
+                    )
+                }
+            } else {
+                val apiKey = if (isOpenAiProvider) openAiApiKey else elevenLabsApiKey
+                val apiKeyLabel = if (isOpenAiProvider) "OpenAI API key" else "ElevenLabs API key"
+                val apiKeyPlaceholder = if (isOpenAiProvider) "sk-..." else "xi-..."
+                val apiKeyHelp = if (isOpenAiProvider) {
+                    "Create an API key in your OpenAI account settings."
+                } else {
+                    "Create an API key in your ElevenLabs profile settings."
+                }
+
+                Text(apiKeyLabel, style = MaterialTheme.typography.titleSmall)
+                Spacer(modifier = Modifier.height(4.dp))
+                OutlinedTextField(
+                    value = apiKey,
+                    onValueChange = {
+                        if (isOpenAiProvider) {
+                            viewModel.setOpenAiApiKey(it)
+                        } else {
+                            viewModel.setElevenLabsApiKey(it)
+                        }
+                    },
+                    modifier = Modifier.fillMaxWidth(),
+                    singleLine = true,
+                    visualTransformation = PasswordVisualTransformation(),
+                    placeholder = { Text(apiKeyPlaceholder) },
+                )
+                Spacer(modifier = Modifier.height(4.dp))
+                Text(
+                    text = apiKeyHelp,
+                    style = MaterialTheme.typography.bodySmall,
+                )
+                if (transcription && apiKey.isBlank()) {
+                    Spacer(modifier = Modifier.height(4.dp))
+                    Text(
+                        text = "Automatic transcription is enabled, but this provider has no API key.",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.error,
+                    )
+                }
             }
 
             Spacer(modifier = Modifier.height(24.dp))

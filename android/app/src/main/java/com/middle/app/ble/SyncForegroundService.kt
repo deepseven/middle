@@ -275,7 +275,13 @@ class SyncForegroundService : Service() {
                     if (!skipTranscription && settings.transcriptionEnabled) {
                         val provider = settings.transcriptionProvider
                         val apiKey = getSelectedProviderApiKey()
-                        if (apiKey.isEmpty()) {
+                        if (provider == Settings.TRANSCRIPTION_PROVIDER_CUSTOM && settings.customSttUrl.isBlank()) {
+                            val message = "Transcription skipped: missing custom endpoint URL"
+                            Log.w(TAG, message)
+                            WebhookLog.error("$message ($filename)")
+                            updateNotification(message)
+                            skipTranscription = true
+                        } else if (provider != Settings.TRANSCRIPTION_PROVIDER_CUSTOM && apiKey.isEmpty()) {
                             val message = "Transcription skipped: missing ${providerDisplayName(provider)} API key"
                             Log.w(TAG, message)
                             WebhookLog.error("$message ($filename)")
@@ -283,7 +289,7 @@ class SyncForegroundService : Service() {
                             skipTranscription = true
                         } else {
                             scope.launch(Dispatchers.IO) {
-                                val client = TranscriptionClient(provider, apiKey)
+                                val client = TranscriptionClient(provider, apiKey, settings.customSttUrl.trim())
                                 val text = client.transcribe(audioFile)
                                 if (text != null) {
                                     repository.saveTranscript(text, audioFile)
@@ -365,6 +371,7 @@ class SyncForegroundService : Service() {
         return when (settings.transcriptionProvider) {
             Settings.TRANSCRIPTION_PROVIDER_OPENAI -> settings.openAiApiKey.trim()
             Settings.TRANSCRIPTION_PROVIDER_ELEVENLABS -> settings.elevenLabsApiKey.trim()
+            Settings.TRANSCRIPTION_PROVIDER_CUSTOM -> settings.customSttApiKey.trim()
             else -> ""
         }
     }
@@ -373,6 +380,7 @@ class SyncForegroundService : Service() {
         return when (provider) {
             Settings.TRANSCRIPTION_PROVIDER_OPENAI -> "OpenAI"
             Settings.TRANSCRIPTION_PROVIDER_ELEVENLABS -> "ElevenLabs"
+            Settings.TRANSCRIPTION_PROVIDER_CUSTOM -> "Custom"
             else -> provider
         }
     }

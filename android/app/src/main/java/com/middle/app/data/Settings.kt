@@ -52,6 +52,14 @@ class Settings(context: Context) {
         get() = prefs.getString(KEY_LAST_BATTERY_VOLTAGE, "N/A") ?: "N/A"
         set(value) = prefs.edit().putString(KEY_LAST_BATTERY_VOLTAGE, value).apply()
 
+    var customSttUrl: String
+        get() = prefs.getString(KEY_CUSTOM_STT_URL, "") ?: ""
+        set(value) = prefs.edit().putString(KEY_CUSTOM_STT_URL, value).apply()
+
+    var customSttApiKey: String
+        get() = prefs.getString(KEY_CUSTOM_STT_API_KEY, "") ?: ""
+        set(value) = prefs.edit().putString(KEY_CUSTOM_STT_API_KEY, value).apply()
+
     var pairedDeviceAddress: String
         get() = prefs.getString(KEY_PAIRED_DEVICE_ADDRESS, "") ?: ""
         set(value) = prefs.edit().putString(KEY_PAIRED_DEVICE_ADDRESS, value).apply()
@@ -73,6 +81,7 @@ class Settings(context: Context) {
     companion object {
         const val TRANSCRIPTION_PROVIDER_OPENAI = "openai"
         const val TRANSCRIPTION_PROVIDER_ELEVENLABS = "elevenlabs"
+        const val TRANSCRIPTION_PROVIDER_CUSTOM = "custom"
 
         private const val KEY_OPENAI_API_KEY = "openai_api_key"
         private const val KEY_ELEVENLABS_API_KEY = "elevenlabs_api_key"
@@ -83,6 +92,8 @@ class Settings(context: Context) {
         private const val KEY_WEBHOOK_URL = "webhook_url"
         private const val KEY_WEBHOOK_BODY_TEMPLATE = "webhook_body_template"
         private const val KEY_LAST_BATTERY_VOLTAGE = "last_battery_voltage"
+        private const val KEY_CUSTOM_STT_URL = "custom_stt_url"
+        private const val KEY_CUSTOM_STT_API_KEY = "custom_stt_api_key"
         private const val KEY_PAIRED_DEVICE_ADDRESS = "paired_device_address"
         private const val KEY_PAIRING_TOKEN = "pairing_token"
         const val DEFAULT_WEBHOOK_BODY_TEMPLATE = "{\"phrase\": \"\$transcript\"}"
