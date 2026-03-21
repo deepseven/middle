@@ -140,6 +140,16 @@ class RecordingsViewModel(application: Application) : AndroidViewModel(applicati
         }
     }
 
+    fun deleteRecordings(toDelete: List<Recording>) {
+        toDelete.forEach { if (_currentlyPlaying.value == it) stopPlayback() }
+        viewModelScope.launch(Dispatchers.IO) {
+            toDelete.forEach {
+                retryQueue.removeForRecording(it.audioFile.name)
+                repository.deleteRecording(it)
+            }
+        }
+    }
+
     fun deleteAllRecordings() {
         stopPlayback()
         val currentRecordings = recordings.value
