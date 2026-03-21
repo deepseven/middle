@@ -77,4 +77,8 @@ dependencies {
     // Core AndroidX.
     implementation("androidx.core:core-ktx:1.15.0")
     implementation("androidx.lifecycle:lifecycle-runtime-ktx:2.8.7")
+
+    // Unit tests.
+    testImplementation("junit:junit:4.13.2")
+    testImplementation("org.jetbrains.kotlinx:kotlinx-coroutines-test:1.7.3")
 }

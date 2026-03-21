@@ -8,10 +8,13 @@ import android.util.Log
 import com.middle.app.data.WebhookLog
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.TimeoutCancellationException
+import kotlinx.coroutines.withTimeout
 import no.nordicsemi.android.ble.BleManager
 import no.nordicsemi.android.ble.data.Data
 import no.nordicsemi.android.ble.ktx.suspend
+import no.nordicsemi.android.ble.observer.ConnectionObserver
 import java.io.ByteArrayOutputStream
+import java.io.IOException
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
 import java.util.concurrent.atomic.AtomicReference
@@ -32,6 +35,23 @@ class PendantBleManager(context: Context) : BleManager(context) {
     // Holds the active transfer state so the notification callback (set once per
     // session) can write to whichever file is currently being received.
     private val activeTransfer = AtomicReference<TransferState?>(null)
+
+    init {
+        // Fail the active transfer immediately on disconnect rather than waiting
+        // for the TRANSFER_TOTAL_TIMEOUT_MILLIS to expire.
+        setConnectionObserver(object : ConnectionObserver {
+            override fun onDeviceDisconnected(device: BluetoothDevice, reason: Int) {
+                activeTransfer.get()?.deferred?.completeExceptionally(
+                    IOException("Pendant disconnected during transfer")
+                )
+            }
+            override fun onDeviceConnecting(device: BluetoothDevice) = Unit
+            override fun onDeviceConnected(device: BluetoothDevice) = Unit
+            override fun onDeviceFailedToConnect(device: BluetoothDevice, reason: Int) = Unit
+            override fun onDeviceReady(device: BluetoothDevice) = Unit
+            override fun onDeviceDisconnecting(device: BluetoothDevice) = Unit
+        })
+    }
 
     private data class TransferState(
         val buffer: ByteArrayOutputStream,
@@ -80,7 +100,7 @@ class PendantBleManager(context: Context) : BleManager(context) {
             .timeout(10_000)
             .useAutoConnect(false)
             .suspend()
-        requestMtu(REQUESTED_MTU).suspend()
+        withTimeout(GATT_OPERATION_TIMEOUT_MILLIS) { requestMtu(REQUESTED_MTU).suspend() }
     }
 
     /**
@@ -90,7 +110,7 @@ class PendantBleManager(context: Context) : BleManager(context) {
     suspend fun readPairingStatus(): Int {
         val characteristic = pairingCharacteristic
             ?: throw IllegalStateException("Not connected or service not discovered.")
-        val data = readCharacteristic(characteristic).suspend()
+        val data = withTimeout(GATT_OPERATION_TIMEOUT_MILLIS) { readCharacteristic(characteristic).suspend() }
         return (data.value?.firstOrNull()?.toInt() ?: 0) and 0xFF
     }
 
@@ -102,17 +122,19 @@ class PendantBleManager(context: Context) : BleManager(context) {
     suspend fun writePairingToken(token: ByteArray) {
         val characteristic = pairingCharacteristic
             ?: throw IllegalStateException("Not connected or service not discovered.")
-        writeCharacteristic(
-            characteristic,
-            token,
-            BluetoothGattCharacteristic.WRITE_TYPE_DEFAULT,
-        ).suspend()
+        withTimeout(GATT_OPERATION_TIMEOUT_MILLIS) {
+            writeCharacteristic(
+                characteristic,
+                token,
+                BluetoothGattCharacteristic.WRITE_TYPE_DEFAULT,
+            ).suspend()
+        }
     }
 
     suspend fun readFileCount(): Int {
         val characteristic = fileCountCharacteristic
             ?: throw IllegalStateException("Not connected or service not discovered.")
-        val data = readCharacteristic(characteristic).suspend()
+        val data = withTimeout(GATT_OPERATION_TIMEOUT_MILLIS) { readCharacteristic(characteristic).suspend() }
         return ByteBuffer.wrap(data.value!!)
             .order(ByteOrder.LITTLE_ENDIAN)
             .short
@@ -122,7 +144,7 @@ class PendantBleManager(context: Context) : BleManager(context) {
     suspend fun readFileInfo(): Int {
         val characteristic = fileInfoCharacteristic
             ?: throw IllegalStateException("Not connected or service not discovered.")
-        val data = readCharacteristic(characteristic).suspend()
+        val data = withTimeout(GATT_OPERATION_TIMEOUT_MILLIS) { readCharacteristic(characteristic).suspend() }
         return ByteBuffer.wrap(data.value!!)
             .order(ByteOrder.LITTLE_ENDIAN)
             .int
@@ -135,7 +157,7 @@ class PendantBleManager(context: Context) : BleManager(context) {
      */
     suspend fun readVoltageMillivolts(): Int? {
         val characteristic = voltageCharacteristic ?: return null
-        val data = readCharacteristic(characteristic).suspend()
+        val data = withTimeout(GATT_OPERATION_TIMEOUT_MILLIS) { readCharacteristic(characteristic).suspend() }
         return ByteBuffer.wrap(data.value!!)
             .order(ByteOrder.LITTLE_ENDIAN)
             .short
@@ -145,11 +167,13 @@ class PendantBleManager(context: Context) : BleManager(context) {
     private suspend fun writeCommand(command: Byte) {
         val characteristic = commandCharacteristic
             ?: throw IllegalStateException("Not connected or service not discovered.")
-        writeCharacteristic(
-            characteristic,
-            byteArrayOf(command),
-            BluetoothGattCharacteristic.WRITE_TYPE_DEFAULT,
-        ).suspend()
+        withTimeout(GATT_OPERATION_TIMEOUT_MILLIS) {
+            writeCharacteristic(
+                characteristic,
+                byteArrayOf(command),
+                BluetoothGattCharacteristic.WRITE_TYPE_DEFAULT,
+            ).suspend()
+        }
     }
 
     /**
@@ -169,7 +193,7 @@ class PendantBleManager(context: Context) : BleManager(context) {
                 state.deferred.complete(state.buffer.toByteArray())
             }
         }
-        enableNotifications(audioCharacteristic).suspend()
+        withTimeout(GATT_OPERATION_TIMEOUT_MILLIS) { enableNotifications(audioCharacteristic).suspend() }
     }
 
     /**
@@ -179,7 +203,7 @@ class PendantBleManager(context: Context) : BleManager(context) {
      */
     suspend fun disableAudioNotifications() {
         val audioCharacteristic = audioDataCharacteristic ?: return
-        disableNotifications(audioCharacteristic).suspend()
+        withTimeout(GATT_OPERATION_TIMEOUT_MILLIS) { disableNotifications(audioCharacteristic).suspend() }
     }
 
     /**
@@ -250,8 +274,11 @@ class PendantBleManager(context: Context) : BleManager(context) {
                 // Stall detected — fall through to retry
                 WebhookLog.error("BLE: stall at ${buffer.size()}/$expectedSize bytes")
             } catch (exception: TimeoutCancellationException) {
-                Log.w(TAG, "Transfer stalled at ${buffer.size()} bytes.")
+                Log.w(TAG, "Transfer timed out at ${buffer.size()} bytes.")
                 WebhookLog.error("BLE: timeout at ${buffer.size()} bytes")
+            } catch (exception: IOException) {
+                Log.w(TAG, "Pendant disconnected during transfer at ${buffer.size()} bytes.")
+                WebhookLog.error("BLE: disconnect at ${buffer.size()} bytes")
             } finally {
                 activeTransfer.set(null)
             }

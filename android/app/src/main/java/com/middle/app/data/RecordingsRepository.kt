@@ -1,6 +1,7 @@
 package com.middle.app.data
 
 import android.content.Context
+import android.util.Log
 import com.middle.app.audio.AudioEncoder
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -27,6 +28,7 @@ class RecordingsRepository(context: Context) {
         _recordings.value = files
             .mapNotNull { Recording.fromFile(it) }
             .sortedByDescending { it.timestamp }
+        Log.d(TAG, "[SyncDebug] refresh() found ${_recordings.value.size} recording(s).")
     }
 
     /**
@@ -37,8 +39,13 @@ class RecordingsRepository(context: Context) {
         withContext(Dispatchers.IO) {
             AudioEncoder.encodeFromIma(imaData, file)
         }
+        Log.d(TAG, "[SyncDebug] encodeFromIma() output path=${file.absolutePath} size=${file.length()} bytes.")
         refresh()
         return file
+    }
+
+    companion object {
+        private const val TAG = "RecordingsRepo"
     }
 
     suspend fun deleteRecording(recording: Recording) {
