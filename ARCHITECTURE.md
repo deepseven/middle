@@ -51,13 +51,18 @@ middle/
 ## Stack
 
 ### Firmware (`src/main.cpp`)
-- **Platform**: ESP32-S3 (esp32-s3-devkitc-1)
+- **Platform**: ESP32-S3 — two board variants:
+  - `esp32-s3-devkitc-1`: original dev-board with external INMP441 I2S mic
+  - `xiao_esp32s3_sense` (XIAO ESP32S3 Sense): built-in PDM mic, SSD1306 OLED
+    on expansion board, `BOARD_XIAO_SENSE` build flag
 - **Framework**: Arduino via PlatformIO (`platformio.ini`)
 - **BLE**: Arduino BLE wrapper over NimBLE; `ble_gatts_notify_custom()` called
   directly to enable retry on mbuf exhaustion (the Arduino wrapper aborts on
   non-zero return, causing ~70–80% data loss).
 - **Storage**: LittleFS (~3 MB partition, `huge_app.csv`)
-- **Audio**: INMP441 I2S MEMS mic; IMA ADPCM encoding at 16 kHz mono (~4 KB/s)
+- **Audio**: INMP441 I2S MEMS mic (devkit) or built-in PDM mic (XIAO Sense,
+  with configurable software gain via `pdm_gain_shift`); IMA ADPCM encoding
+  at 16 kHz mono (~4 KB/s)
 - **Concurrency**: FreeRTOS — sampling loop on core 1, flash writer task on core 0
 
 ### Host sync script (`sync.py`)
@@ -121,7 +126,10 @@ up to 200 times (5 ms delay) on mbuf exhaustion.
 ## Audio pipeline
 
 ```
-INMP441 (I2S, 32-bit stereo) → left channel >> 16 → int16 PCM
+Microphone
+├─ DevKit path:  INMP441 (I2S, 32-bit stereo) → left channel >> 16 → int16 PCM
+└─ XIAO path:    Built-in PDM mic (GPIO 42 clk / GPIO 41 data) → int16 PCM
+                 → software gain (pdm_gain_shift, default 8× with clamp)
   → IMA ADPCM encoder (firmware, src/main.cpp)
   → packed nibbles in LittleFS (.ima file, 4-byte sample-count header)
   → BLE notify stream
@@ -173,11 +181,12 @@ Key details:
 ## Firmware device lifecycle
 
 ```
-[Deep sleep, ~7µA] → button press (ext0 wakeup)
+[Deep sleep, ~7µA devkit / ~3mA XIAO] → button press (ext0 wakeup)
   → if button LOW: record IMA ADPCM to LittleFS
   → if duration < 1000ms: discard (sync-only tap)
   → start BLE advertising (10 s window, 30 s hard deadline)
     → phone connects → sync all pending files → ACK → delete from flash
+      (hard sleep deadline is suppressed while a client is connected)
     → no connection → recordings accumulate on flash
   → deep sleep
 ```

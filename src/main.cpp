@@ -51,6 +51,13 @@ static const unsigned long minimum_recording_milliseconds = 1000;
 // transient (~100ms at 16 kHz).
 static const size_t i2s_startup_discard_samples = 1600;
 
+#ifdef BOARD_XIAO_SENSE
+// Software gain for the XIAO Sense's built-in PDM mic, which produces
+// lower-amplitude samples than the INMP441.  Expressed as a left-shift
+// count: 2 = 4x gain.  Increase to 3 (8x) if still too quiet.
+static const int pdm_gain_shift = 3;
+#endif
+
 // IMA ADPCM step size table — indexed by step_index (0..88).
 static const int16_t adpcm_step_table[89] = {
     7,     8,     9,     10,    11,    12,    13,    14,    16,    17,
@@ -619,7 +626,10 @@ static bool record_and_save() {
 #ifdef BOARD_XIAO_SENSE
       size_t total_samples = bytes_read / sizeof(int16_t);
       for (size_t i = 0; i < total_samples; i++) {
-        int16_t sample_16 = i2s_buf[i];
+        int32_t amplified = (int32_t)i2s_buf[i] << pdm_gain_shift;
+        if (amplified > 32767) amplified = 32767;
+        else if (amplified < -32768) amplified = -32768;
+        int16_t sample_16 = (int16_t)amplified;
 #else
       size_t total_samples = bytes_read / sizeof(int32_t);
       for (size_t i = 0; i < total_samples; i += 2) {
@@ -1051,6 +1061,7 @@ void loop() {
   }
 
   if (button_state == HIGH && hard_sleep_deadline_milliseconds != 0 &&
+      !client_connected &&
       (long)(millis() - hard_sleep_deadline_milliseconds) >= 0) {
     enter_deep_sleep();
   }
