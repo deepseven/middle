@@ -717,11 +717,13 @@ static bool send_notification(uint16_t connection_id, uint16_t attribute_handle,
 // kept open in pending_stream_file for stream_prepared_file() to consume.
 static void prepare_current_file() {
   if (!client_connected || ble_server == nullptr) {
+    Serial.printf("[ble] prepare_current_file: not connected, skipping\r\n");
     return;
   }
 
   current_stream_path = next_recording_path();
   if (current_stream_path.length() == 0) {
+    Serial.printf("[ble] prepare_current_file: no files to send\r\n");
     uint32_t empty = 0;
     file_info_characteristic->setValue(empty);
     return;
@@ -729,6 +731,8 @@ static void prepare_current_file() {
 
   pending_stream_file = LittleFS.open(current_stream_path, FILE_READ);
   if (!pending_stream_file) {
+    Serial.printf("[ble] prepare_current_file: failed to open %s\r\n",
+                  current_stream_path.c_str());
     current_stream_path = "";
     uint32_t empty = 0;
     file_info_characteristic->setValue(empty);
@@ -737,6 +741,8 @@ static void prepare_current_file() {
 
   uint32_t file_size = pending_stream_file.size();
   file_info_characteristic->setValue(file_size);
+  Serial.printf("[ble] prepared %s (%u bytes)\r\n",
+                current_stream_path.c_str(), file_size);
 }
 
 // Streams the file prepared by prepare_current_file() via BLE notifications,
@@ -748,6 +754,7 @@ static void stream_prepared_file() {
   }
 
   if (!client_connected || ble_server == nullptr) {
+    Serial.printf("[ble] stream: client disconnected before start\r\n");
     pending_stream_file.close();
     return;
   }
@@ -764,16 +771,34 @@ static void stream_prepared_file() {
     chunk_size = sizeof(chunk);
   }
 
+  uint32_t total_sent = 0;
+  int chunks_since_yield = 0;
+  Serial.printf("[ble] streaming %s, mtu=%u chunk=%d\r\n",
+                current_stream_path.c_str(), mtu, chunk_size);
+
   while (pending_stream_file.available() && client_connected) {
     int bytes_read = pending_stream_file.read(chunk, chunk_size);
     if (bytes_read > 0) {
       if (!send_notification(connection_id, attribute_handle, chunk,
                              bytes_read)) {
+        Serial.printf("[ble] stream: send_notification failed at %u bytes\r\n",
+                      total_sent);
         break;
+      }
+      total_sent += bytes_read;
+      chunks_since_yield++;
+      // Yield briefly every 4 chunks to let the remote BLE stack drain
+      // its receive buffer. Without this, some Android phones (especially
+      // older models) silently drop notifications under sustained load.
+      if (chunks_since_yield >= 4) {
+        chunks_since_yield = 0;
+        delay(2);
       }
     }
   }
   pending_stream_file.close();
+  Serial.printf("[ble] stream done: %u bytes sent, connected=%d\r\n",
+                total_sent, (int)client_connected);
 }
 
 static uint16_t read_battery_millivolts() {
@@ -853,9 +878,11 @@ static bool nvs_write_pair_token(const uint8_t token[pairing_token_length]) {
 class server_callbacks : public BLEServerCallbacks {
   void onConnect(BLEServer *server) override {
     client_connected = true;
+    Serial.printf("[ble] client connected\r\n");
   }
 
   void onDisconnect(BLEServer *server) override {
+    Serial.printf("[ble] client disconnected\r\n");
     client_connected = false;
     connection_authenticated = false;
     pending_command = 0;
@@ -875,6 +902,7 @@ class command_callbacks : public BLECharacteristicCallbacks {
     String value = characteristic->getValue();
     if (value.length() > 0) {
       pending_command = (uint8_t)value[0];
+      Serial.printf("[ble] command received: 0x%02x\r\n", pending_command);
     }
   }
 };

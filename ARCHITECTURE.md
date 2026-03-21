@@ -121,6 +121,23 @@ middle/
 **Retry**: up to 3 attempts per file on timeout; firmware retries each notification
 up to 200 times (5 ms delay) on mbuf exhaustion.
 
+**Notification pacing**: firmware yields `delay(2)` every 4 notification chunks to
+prevent the Android BLE stack from silently dropping notifications when they
+arrive faster than the stack can drain them. Without pacing, Samsung S10 (and
+likely other phones) would drop ~5–20% of chunks, causing the phone to wait
+for the full 120 s timeout before retrying.
+
+**Stall detection** (Android): instead of blocking for the full 120 s timeout,
+`PendantBleManager.requestNextFile()` polls the receive buffer every 3 s. If the
+buffer size hasn't grown in two consecutive polls (6 s of no data), the transfer
+is considered stalled and retried immediately. This reduces worst-case stall
+recovery from 120 s to ~6 s per attempt.
+
+**In-app BLE logging**: key sync lifecycle events (connect, file count, transfer
+progress, stall/timeout, retry, completion, failure) are published to
+`WebhookLog`, making them visible on the app's Log screen alongside webhook
+and transcription entries.
+
 ---
 
 ## Audio pipeline
@@ -274,14 +291,19 @@ uv run python -m py_compile sync.py    # syntax check
   `EncryptedSharedPreferences` using AES-256-GCM. No plaintext secrets on disk.
 - **Audio format divergence**: `sync.py` outputs MP3 (via `lameenc`); the Android
   app outputs M4A/AAC (via `MediaCodec`). Both are accepted by OpenAI's API.
+- **Custom STT WAV conversion**: when using a custom STT endpoint, the Android
+  app converts M4A → WAV in memory (`AudioEncoder.m4aToWav()`) before sending,
+  because custom Whisper-compatible servers typically expect `audio/wav`. The
+  built-in OpenAI and ElevenLabs providers send M4A directly.
 
 ---
 
 ## Open questions / known gaps
 
-- **No security on BLE**: any device that knows the service UUID can connect and
-  download recordings. A pre-shared key is listed in `TODO.md` but not yet
-  implemented.
+- **BLE security is TOFU only**: the pairing mechanism uses a trust-on-first-use
+  16-byte token. A device that connects before the legitimate phone claims the
+  pendant can steal the token. There is no encryption or authentication beyond
+  this token exchange.
 - **No automated tests**: no firmware tests, no Python tests, no Android
   instrumentation tests. The `AGENTS.md` documents the intended test commands
   for when they are added.

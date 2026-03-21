@@ -1,6 +1,7 @@
 package com.middle.app.transcription
 
 import android.util.Log
+import com.middle.app.audio.AudioEncoder
 import com.middle.app.data.Settings
 import com.middle.app.data.WebhookLog
 import okhttp3.MediaType.Companion.toMediaType
@@ -8,6 +9,7 @@ import okhttp3.MultipartBody
 import okhttp3.OkHttpClient
 import okhttp3.Request
 import okhttp3.RequestBody.Companion.asRequestBody
+import okhttp3.RequestBody.Companion.toRequestBody
 import org.json.JSONObject
 import java.io.File
 import java.util.concurrent.TimeUnit
@@ -116,13 +118,26 @@ class TranscriptionClient(
             return null
         }
 
-        val mimeType = "audio/mp4"
+        // The custom server expects audio/wav (like OpenAI Whisper).
+        // Convert the M4A recording to WAV in memory before sending.
+        val wavBytes = try {
+            AudioEncoder.m4aToWav(audioFile)
+        } catch (exception: Exception) {
+            Log.e(TAG, "WAV conversion failed: $exception")
+            WebhookLog.error("Transcription failed (Custom): WAV conversion error: ${exception.message}")
+            return null
+        }
+
+        val wavMime = "audio/wav".toMediaType()
         val bodyBuilder = MultipartBody.Builder()
             .setType(MultipartBody.FORM)
+            .addFormDataPart("model", CUSTOM_TRANSCRIPTION_MODEL)
+            .addFormDataPart("response_format", "json")
+            .addFormDataPart("temperature", "0")
             .addFormDataPart(
                 "file",
-                audioFile.name,
-                audioFile.asRequestBody(mimeType.toMediaType()),
+                "audio.wav",
+                wavBytes.toRequestBody(wavMime),
             )
 
         val requestBuilder = Request.Builder()
@@ -133,6 +148,8 @@ class TranscriptionClient(
             requestBuilder.header("Authorization", "Bearer $apiKey")
         }
 
+        Log.d(TAG, "Custom STT request: url=$customUrl wavSize=${wavBytes.size} (from ${audioFile.name} ${audioFile.length()} bytes)")
+
         return try {
             val response = httpClient.newCall(requestBuilder.build()).execute()
             if (!response.isSuccessful) {
@@ -142,6 +159,7 @@ class TranscriptionClient(
                 null
             } else {
                 val body = response.body?.string() ?: return null
+                Log.d(TAG, "Custom STT response: $body")
                 parseTranscriptText(body, "Custom")
             }
         } catch (exception: Exception) {
@@ -179,5 +197,18 @@ class TranscriptionClient(
         private const val OPENAI_TRANSCRIPTION_URL = "https://api.openai.com/v1/audio/transcriptions"
         private const val ELEVENLABS_TRANSCRIPTION_MODEL = "scribe_v2"
         private const val ELEVENLABS_TRANSCRIPTION_URL = "https://api.elevenlabs.io/v1/speech-to-text"
+        private const val CUSTOM_TRANSCRIPTION_MODEL = "whisper-1"
+
+        private fun mimeTypeForFile(file: File): String {
+            return when (file.extension.lowercase()) {
+                "m4a", "mp4" -> "audio/mp4"
+                "wav" -> "audio/wav"
+                "mp3" -> "audio/mpeg"
+                "ogg" -> "audio/ogg"
+                "flac" -> "audio/flac"
+                "webm" -> "audio/webm"
+                else -> "application/octet-stream"
+            }
+        }
     }
 }

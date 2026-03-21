@@ -5,9 +5,9 @@ import android.bluetooth.BluetoothGatt
 import android.bluetooth.BluetoothGattCharacteristic
 import android.content.Context
 import android.util.Log
+import com.middle.app.data.WebhookLog
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.TimeoutCancellationException
-import kotlinx.coroutines.withTimeout
 import no.nordicsemi.android.ble.BleManager
 import no.nordicsemi.android.ble.data.Data
 import no.nordicsemi.android.ble.ktx.suspend
@@ -195,6 +195,7 @@ class PendantBleManager(context: Context) : BleManager(context) {
         for (attempt in 1..MAX_FILE_TRANSFER_ATTEMPTS) {
             if (attempt > 1) {
                 Log.w(TAG, "Retrying file transfer (attempt $attempt/$MAX_FILE_TRANSFER_ATTEMPTS).")
+                WebhookLog.info("BLE: retry $attempt/$MAX_FILE_TRANSFER_ATTEMPTS")
             }
 
             val buffer = ByteArrayOutputStream()
@@ -212,11 +213,13 @@ class PendantBleManager(context: Context) : BleManager(context) {
 
                 val expectedSize = readFileInfo()
                 Log.d(TAG, "Expecting $expectedSize bytes.")
+                WebhookLog.info("BLE: expecting $expectedSize bytes")
 
                 // Empty files are corrupt or aborted recordings. Return null
                 // immediately rather than retrying.
                 if (expectedSize == 0) {
                     Log.w(TAG, "File is empty, skipping.")
+                    WebhookLog.info("BLE: file empty, skipping")
                     return null
                 }
 
@@ -234,12 +237,21 @@ class PendantBleManager(context: Context) : BleManager(context) {
                 // the read would race notifications against the read response.
                 writeCommand(COMMAND_START_STREAM)
 
-                val result = withTimeout(TRANSFER_TOTAL_TIMEOUT_MILLIS) {
-                    transferComplete.await()
+                // Wait for the transfer to complete, but also watch for stalls
+                // where the BLE connection is alive but data stops flowing
+                // (e.g., Android dropped some notifications).
+                val result = waitForTransferWithStallDetection(
+                    transferComplete, buffer, expectedSize,
+                )
+                if (result != null) {
+                    WebhookLog.info("BLE: received ${result.size} bytes")
+                    return result.copyOfRange(0, expectedSize)
                 }
-                return result.copyOfRange(0, expectedSize)
+                // Stall detected — fall through to retry
+                WebhookLog.error("BLE: stall at ${buffer.size()}/$expectedSize bytes")
             } catch (exception: TimeoutCancellationException) {
                 Log.w(TAG, "Transfer stalled at ${buffer.size()} bytes.")
+                WebhookLog.error("BLE: timeout at ${buffer.size()} bytes")
             } finally {
                 activeTransfer.set(null)
             }
@@ -248,6 +260,50 @@ class PendantBleManager(context: Context) : BleManager(context) {
         throw RuntimeException(
             "Failed to transfer file after $MAX_FILE_TRANSFER_ATTEMPTS attempts."
         )
+    }
+
+    /**
+     * Waits for the transfer to complete, but detects stalls where data stops
+     * arriving. Instead of waiting the full 120s, polls the buffer every 3
+     * seconds. If the buffer hasn't grown in two consecutive polls, the
+     * transfer is considered stalled and returns null for a retry.
+     */
+    private suspend fun waitForTransferWithStallDetection(
+        deferred: CompletableDeferred<ByteArray>,
+        buffer: ByteArrayOutputStream,
+        expectedSize: Int,
+    ): ByteArray? {
+        var lastSize = 0
+        var stallCount = 0
+        val startTime = System.currentTimeMillis()
+        val maxWaitMillis = TRANSFER_TOTAL_TIMEOUT_MILLIS
+
+        while (System.currentTimeMillis() - startTime < maxWaitMillis) {
+            // Check every 3 seconds.
+            kotlinx.coroutines.delay(3_000)
+
+            if (deferred.isCompleted) {
+                return deferred.await()
+            }
+
+            val currentSize = buffer.size()
+            Log.d(TAG, "Transfer progress: $currentSize/$expectedSize bytes")
+
+            if (currentSize == lastSize) {
+                stallCount++
+                if (stallCount >= 2) {
+                    // No data for 6 seconds — firmware probably finished
+                    // but we lost some notifications.
+                    Log.w(TAG, "Transfer stall detected: stuck at $currentSize/$expectedSize")
+                    return null
+                }
+            } else {
+                stallCount = 0
+            }
+            lastSize = currentSize
+        }
+        // Overall timeout.
+        return null
     }
 
     suspend fun acknowledgeFile() {

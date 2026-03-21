@@ -233,9 +233,11 @@ class SyncForegroundService : Service() {
             updateNotification(getString(R.string.sync_notification_syncing))
             val fileCount = manager.readFileCount()
             Log.d(TAG, "Pendant reports $fileCount pending recording(s).")
+            WebhookLog.info("BLE: connected, $fileCount file(s) pending")
 
             if (fileCount == 0) {
                 manager.syncDone()
+                WebhookLog.info("BLE: no files, sync done")
                 return
             }
 
@@ -336,6 +338,7 @@ class SyncForegroundService : Service() {
 
                 manager.syncDone()
                 Log.d(TAG, "Sync complete, $fileCount file(s) transferred.")
+                WebhookLog.info("BLE: sync complete, $fileCount file(s)")
             } finally {
                 try {
                     manager.disableAudioNotifications()
@@ -345,6 +348,7 @@ class SyncForegroundService : Service() {
             }
         } catch (exception: Exception) {
             Log.e(TAG, "Sync failed: $exception")
+            WebhookLog.error("BLE: sync failed: ${exception.message}")
         } finally {
             try {
                 manager.disconnect().enqueue()
