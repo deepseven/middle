@@ -33,12 +33,12 @@ middle/
 │       ├── transcription/
 │       │   └── TranscriptionClient.kt  # OpenAI gpt-4o-transcribe via raw OkHttp multipart POST
 │       ├── ui/           # Compose screens
-│       │   ├── RecordingsScreen.kt     # List of recordings with play/share/delete/resend-webhook
+│       │   ├── RecordingsScreen.kt     # List of recordings with play/share/delete/transcribe/webhook; multi-select with bulk transcribe/copy/delete
 │       │   ├── SettingsScreen.kt       # API key, background sync, transcription, webhook toggles
 │       │   ├── LogScreen.kt            # Webhook delivery log (monospace, error-coloured)
 │       │   └── theme/Theme.kt          # Material3 theme
 │       ├── viewmodel/
-│       │   ├── RecordingsViewModel.kt  # Playback (MediaPlayer), delete, manual webhook resend
+│       │   ├── RecordingsViewModel.kt  # Playback (MediaPlayer), delete, manual webhook resend, single/batch transcription
 │       │   └── SettingsViewModel.kt    # Thin wrapper exposing Settings as StateFlows
 │       ├── MainActivity.kt             # Permission request, starts SyncForegroundService, nav host
 │       └── MiddleApplication.kt        # App singleton: RecordingsRepository, WebhookRetryQueue, notification channel
@@ -217,7 +217,7 @@ divider. Non-linear correction applied: `factor = 13020 − 65 × raw_mV / 100`.
 
 | Screen | Route | Description |
 |---|---|---|
-| Recordings | `recordings` | List of synced recordings (newest first). Each card shows timestamp, duration, transcript preview (3 lines), and play/share/delete/resend-webhook buttons. Sync status and battery voltage shown in a header card. |
+| Recordings | `recordings` | List of synced recordings (newest first). Each card shows timestamp, duration, transcript preview (3 lines), and play/share/delete/transcribe/resend-webhook buttons. Long-press enters multi-select mode with bulk delete, transcribe, and copy-transcripts actions. Sync status and battery voltage shown in a header card. |
 | Log | `log` | Monospace webhook delivery log (last 50 entries, errors in red). |
 | Settings | `settings` | OpenAI API key (masked), background sync toggle, transcription toggle, webhook toggle + URL + body template. |
 

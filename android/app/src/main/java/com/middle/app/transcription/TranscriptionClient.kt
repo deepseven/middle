@@ -140,17 +140,17 @@ class TranscriptionClient(
                 wavBytes.toRequestBody(wavMime),
             )
 
-        val requestBuilder = Request.Builder()
-            .url(customUrl)
-            .post(bodyBuilder.build())
-
-        if (apiKey.isNotEmpty()) {
-            requestBuilder.header("Authorization", "Bearer $apiKey")
-        }
-
         Log.d(TAG, "Custom STT request: url=$customUrl wavSize=${wavBytes.size} (from ${audioFile.name} ${audioFile.length()} bytes)")
 
         return try {
+            val requestBuilder = Request.Builder()
+                .url(customUrl)
+                .post(bodyBuilder.build())
+
+            if (apiKey.isNotEmpty()) {
+                requestBuilder.header("Authorization", "Bearer $apiKey")
+            }
+
             val response = httpClient.newCall(requestBuilder.build()).execute()
             if (!response.isSuccessful) {
                 val bodyText = response.body?.string() ?: ""

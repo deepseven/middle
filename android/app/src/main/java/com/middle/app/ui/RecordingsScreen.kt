@@ -23,6 +23,7 @@ import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.text.selection.SelectionContainer
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Close
+import androidx.compose.material.icons.filled.Create
 import androidx.compose.material.icons.filled.Delete
 import androidx.compose.material.icons.filled.Menu
 import androidx.compose.material.icons.filled.PlayArrow
@@ -74,6 +75,7 @@ fun RecordingsScreen(
     val batteryVoltage by SyncForegroundService.batteryVoltage.collectAsState()
     var showDeleteAllDialog by remember { mutableStateOf(false) }
     var showDeleteSelectedDialog by remember { mutableStateOf(false) }
+    val context = LocalContext.current
 
     // Selection mode state.
     var selectionMode by remember { mutableStateOf(false) }
@@ -158,6 +160,34 @@ fun RecordingsScreen(
                     },
                     actions = {
                         if (selectedItems.isNotEmpty()) {
+                            // Copy transcripts for selected items.
+                            TextButton(onClick = {
+                                val transcripts = recordings
+                                    .filter { it.audioFile.absolutePath in selectedItems && it.hasTranscript }
+                                    .mapNotNull { it.transcriptText?.trim() }
+                                    .filter { it.isNotEmpty() }
+                                if (transcripts.isEmpty()) {
+                                    Toast.makeText(context, "No transcripts to copy", Toast.LENGTH_SHORT).show()
+                                } else {
+                                    val combined = transcripts.joinToString("\n\n")
+                                    val clipboard = context.getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
+                                    clipboard.setPrimaryClip(ClipData.newPlainText("Transcripts", combined))
+                                    Toast.makeText(context, "Copied ${transcripts.size} transcript(s)", Toast.LENGTH_SHORT).show()
+                                }
+                            }) {
+                                Text("Copy")
+                            }
+                            // Transcribe selected items.
+                            if (viewModel.transcriptionAvailable) {
+                                IconButton(onClick = {
+                                    val toTranscribe = recordings.filter { it.audioFile.absolutePath in selectedItems }
+                                    viewModel.transcribeRecordings(toTranscribe)
+                                    selectionMode = false
+                                    selectedItems.clear()
+                                }) {
+                                    Icon(Icons.Default.Create, contentDescription = "Transcribe selected")
+                                }
+                            }
                             IconButton(onClick = { showDeleteSelectedDialog = true }) {
                                 Icon(Icons.Default.Delete, contentDescription = "Delete selected")
                             }
@@ -275,6 +305,8 @@ fun RecordingsScreen(
                             onDelete = { viewModel.deleteRecording(recording) },
                             showResendWebhook = viewModel.webhookEnabled && (recording.hasTranscript || viewModel.transcriptionAvailable),
                             onResendWebhook = { viewModel.sendWebhook(recording) },
+                            showTranscribe = viewModel.transcriptionAvailable,
+                            onTranscribe = { viewModel.transcribeRecording(recording) },
                         )
                     }
                 }
@@ -297,6 +329,8 @@ private fun RecordingItem(
     onDelete: () -> Unit,
     showResendWebhook: Boolean,
     onResendWebhook: () -> Unit,
+    showTranscribe: Boolean = false,
+    onTranscribe: () -> Unit = {},
 ) {
     val context = LocalContext.current
     var showDeleteDialog by remember { mutableStateOf(false) }
@@ -406,6 +440,15 @@ private fun RecordingItem(
                             imageVector = Icons.Default.Delete,
                             contentDescription = "Delete",
                         )
+                    }
+
+                    if (showTranscribe) {
+                        IconButton(onClick = onTranscribe) {
+                            Icon(
+                                imageVector = Icons.Default.Create,
+                                contentDescription = "Transcribe",
+                            )
+                        }
                     }
 
                     if (showResendWebhook) {

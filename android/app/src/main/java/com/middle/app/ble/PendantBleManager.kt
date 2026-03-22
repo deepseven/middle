@@ -279,6 +279,11 @@ class PendantBleManager(context: Context) : BleManager(context) {
             } catch (exception: IOException) {
                 Log.w(TAG, "Pendant disconnected during transfer at ${buffer.size()} bytes.")
                 WebhookLog.error("BLE: disconnect at ${buffer.size()} bytes")
+            } catch (exception: kotlinx.coroutines.CancellationException) {
+                throw exception
+            } catch (exception: Exception) {
+                Log.w(TAG, "Transfer failed at ${buffer.size()} bytes: $exception")
+                WebhookLog.error("BLE: error at ${buffer.size()} bytes: ${exception::class.simpleName}")
             } finally {
                 activeTransfer.set(null)
             }

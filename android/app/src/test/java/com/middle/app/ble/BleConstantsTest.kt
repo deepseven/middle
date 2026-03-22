@@ -89,8 +89,8 @@ class BleConstantsTest {
     @Test
     fun `transfer timeout is positive and reasonable`() {
         assertTrue(
-            "Transfer timeout should be at least 10 seconds",
-            TRANSFER_TOTAL_TIMEOUT_MILLIS >= 10_000L,
+            "Transfer timeout should be at least 60 seconds to handle large files",
+            TRANSFER_TOTAL_TIMEOUT_MILLIS >= 60_000L,
         )
         assertTrue(
             "Transfer timeout should be at most 5 minutes",
