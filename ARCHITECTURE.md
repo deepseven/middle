@@ -230,9 +230,9 @@ Navigation uses a `ModalNavigationDrawer` (hamburger icon in each screen's top b
 | Path | Reason |
 |---|---|
 | `src/main.cpp` | Entire firmware: recording, BLE server, ADPCM encoder, notification retry |
-| `src/main.cpp:send_notification()` (line 544) | NimBLE notification retry loop (up to 200 attempts, 5 ms delay) |
-| `src/main.cpp:record_and_save()` (line 412) | I2S capture, ring buffer, FreeRTOS writer task, ADPCM encoding |
-| `sync.py:sync_recordings()` (line 171) | BLE transfer loop with per-file retry (`MAX_FILE_TRANSFER_ATTEMPTS=3`) and stall/total timeouts |
+| `src/main.cpp:send_notification()` (line 570) | NimBLE notification retry loop (up to 200 attempts, 5 ms delay) |
+| `src/main.cpp:record_and_save()` (line 434) | I2S capture, ring buffer, FreeRTOS writer task, ADPCM encoding |
+| `sync.py:sync_recordings()` (line 210) | BLE transfer loop with per-file retry (`MAX_FILE_TRANSFER_ATTEMPTS=3`) and stall/total timeouts |
 | `android/.../WebhookRetryQueue.kt` | Webhook persistence, exponential backoff, 4xx vs 5xx handling |
 | `android/.../WebhookClient.kt` | OkHttp POST, Basic Auth from URL credentials |
 | `android/.../PendantBleManager.kt` | Nordic BLE manager: scan, connect, sync orchestration |
@@ -310,10 +310,9 @@ uv run python -m py_compile sync.py    # syntax check
 - **`backgroundSyncEnabled` setting is stored but not enforced**: `Settings.kt`
   exposes the toggle and `SettingsScreen.kt` renders it, but
   `SyncForegroundService` does not read it — the service always scans regardless
-  of the toggle value. The scan loop uses `SCAN_MODE_LOW_POWER` (2 s window /
-  9 s period) when the app is backgrounded and `SCAN_MODE_LOW_LATENCY` (2 s
-  window / 3 s period) when foregrounded; these constants live in
-  `BleConstants.kt`.
+  of the toggle value. Both foreground and background scan profiles use
+  `SCAN_MODE_LOW_LATENCY`; the only difference is the period (3 s foreground,
+  3 s background — currently identical). Constants live in `BleConstants.kt`.
 - **ExoPlayer dependency is declared but unused**: `media3-exoplayer:1.2.1` is in
   `build.gradle.kts` but playback uses `MediaPlayer` directly in
   `RecordingsViewModel.kt`.
