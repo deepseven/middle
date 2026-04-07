@@ -40,6 +40,7 @@ middle/
 │       ├── viewmodel/
 │       │   ├── RecordingsViewModel.kt  # Playback (MediaPlayer), delete, manual webhook resend, single/batch transcription
 │       │   └── SettingsViewModel.kt    # Thin wrapper exposing Settings as StateFlows
+│       ├── TaskerReceiver.kt           # BroadcastReceiver for Tasker PTT start/stop intents
 │       ├── MainActivity.kt             # Permission request, starts SyncForegroundService, nav host
 │       └── MiddleApplication.kt        # App singleton: RecordingsRepository, WebhookRetryQueue, notification channel
 ├── platformio.ini        # PlatformIO build config
@@ -51,18 +52,20 @@ middle/
 ## Stack
 
 ### Firmware (`src/main.cpp`)
-- **Platform**: ESP32-S3 — two board variants:
+- **Platform**: ESP32-S3 and ESP32 — three board variants:
   - `esp32-s3-devkitc-1`: original dev-board with external INMP441 I2S mic
   - `xiao_esp32s3_sense` (XIAO ESP32S3 Sense): built-in PDM mic, SSD1306 OLED
     on expansion board, `BOARD_XIAO_SENSE` build flag
+  - `m5stick_c_plus2` (M5StickC Plus2): ESP32-PICO-V3-02, built-in SPM1423
+    PDM mic, ST7789V2 TFT display (135×240), `BOARD_M5STICKCPLUS2` build flag
 - **Framework**: Arduino via PlatformIO (`platformio.ini`)
 - **BLE**: Arduino BLE wrapper over NimBLE; `ble_gatts_notify_custom()` called
   directly to enable retry on mbuf exhaustion (the Arduino wrapper aborts on
   non-zero return, causing ~70–80% data loss).
 - **Storage**: LittleFS (~3 MB partition, `huge_app.csv`)
-- **Audio**: INMP441 I2S MEMS mic (devkit) or built-in PDM mic (XIAO Sense,
-  with configurable software gain via `pdm_gain_shift`); IMA ADPCM encoding
-  at 16 kHz mono (~4 KB/s)
+- **Audio**: INMP441 I2S MEMS mic (devkit), built-in PDM mic (XIAO Sense /
+  M5StickC Plus2, with configurable software gain via `pdm_gain_shift`);
+  IMA ADPCM encoding at 16 kHz mono (~4 KB/s)
 - **Concurrency**: FreeRTOS — sampling loop on core 1, flash writer task on core 0
 
 ### Host sync script (`sync.py`)
@@ -121,11 +124,12 @@ middle/
 **Retry**: up to 3 attempts per file on timeout; firmware retries each notification
 up to 200 times (5 ms delay) on mbuf exhaustion.
 
-**Notification pacing**: firmware yields `delay(2)` every 4 notification chunks to
-prevent the Android BLE stack from silently dropping notifications when they
-arrive faster than the stack can drain them. Without pacing, Samsung S10 (and
-likely other phones) would drop ~5–20% of chunks, causing the phone to wait
-for the full 120 s timeout before retrying.
+**Notification pacing**: on NimBLE boards (ESP32-S3), firmware yields `delay(2)`
+every 4 notification chunks to prevent the Android BLE stack from silently
+dropping notifications. On BlueDroid boards (M5StickC Plus2 / ESP32), firmware
+yields `delay(8)` after every notification because BlueDroid's `notify()` silently
+drops data when the TX queue is full. Without pacing, phones would drop ~5–20%
+of chunks, causing the phone to wait for the full 120 s timeout before retrying.
 
 **Stall detection** (Android): instead of blocking for the full 120 s timeout,
 `PendantBleManager.requestNextFile()` polls the receive buffer every 3 s. If the
@@ -143,9 +147,11 @@ and transcription entries.
 ## Audio pipeline
 
 ```
-Microphone
+Pendant microphone (BLE path)
 ├─ DevKit path:  INMP441 (I2S, 32-bit stereo) → left channel >> 16 → int16 PCM
-└─ XIAO path:    Built-in PDM mic (GPIO 42 clk / GPIO 41 data) → int16 PCM
+├─ XIAO path:    Built-in PDM mic (GPIO 42 clk / GPIO 41 data) → int16 PCM
+│                → software gain (pdm_gain_shift, default 8× with clamp)
+└─ M5Stick path: SPM1423 PDM mic (GPIO 0 clk / GPIO 34 data) → int16 PCM
                  → software gain (pdm_gain_shift, default 8× with clamp)
   → IMA ADPCM encoder (firmware, src/main.cpp)
   → packed nibbles in LittleFS (.ima file, 4-byte sample-count header)
@@ -156,6 +162,13 @@ Microphone
   → MP3 (lameenc, sync.py) or AAC/M4A (MediaCodec, Android)
   → optional transcription (OpenAI gpt-4o-transcribe)
   → optional webhook delivery (POST with configurable JSON body template)
+
+Phone microphone (PTT path)
+  Tasker sends ACTION_PTT_START → TaskerReceiver → SyncForegroundService
+  → AudioRecord (16 kHz mono PCM16, prefers USB mic if attached)
+  → Tasker sends ACTION_PTT_STOP → PCM accumulated in memory
+  → AAC/M4A (MediaCodec, AudioEncoder.encodeToM4a)
+  → optional transcription + webhook (same pipeline as BLE path)
 ```
 
 **File format**: `.ima` — 4-byte little-endian uint32 sample count, followed by
@@ -169,6 +182,52 @@ to skip the INMP441's internal startup transient.
 
 **Minimum recording**: recordings shorter than 1000 ms are discarded (used as
 a sync-only tap gesture).
+
+---
+
+## Display and button behaviour
+
+### Display auto-off
+
+Boards with a display (XIAO Sense OLED, M5StickC Plus2 TFT) use a 3-second
+auto-off timer. After any display update the timer resets; when it expires the
+firmware turns the display off (OLED enters power-save mode, TFT enters sleep
+mode and the backlight (GPIO 27) goes LOW). This keeps screen-on time minimal
+during recording — the screen shows "Recording..." once at the start and then
+auto-offs after 3 seconds while recording continues.
+
+### Buttons (M5StickC Plus2)
+
+| Button | GPIO | Short press | Long press |
+|---|---|---|---|
+| BtnA (front) | 37 | Start recording (hold to record, release to stop) | — |
+| BtnB (side) | 39 | Force BLE advertising (manual sync trigger) | Show random Oblique Strategy (≥ 1 s) |
+| BtnPWR (right) | 35 | Show status screen (file count + free KB) | Power off (≥ 2 s, releases GPIO 4 power hold) |
+
+BtnA and BtnPWR are deep-sleep wakeup sources (ext0 and ext1 respectively).
+Waking via BtnPWR shows the status screen and enters the main loop with a
+short wake window so the BtnB/BtnPWR handlers remain active (allowing a
+subsequent BtnB press for sync or a long BtnPWR press for power-off). The
+device returns to deep sleep when the wake window expires.
+
+On cold boot (not a wakeup), `tft_init()` keeps the backlight off and the
+firmware enters deep sleep immediately — no screen flash.
+
+### Buttons (XIAO Sense)
+
+Only the D1 button (GPIO 2) on the expansion board is used for recording.
+
+### Display states
+
+| State | Line 1 | Line 2 |
+|---|---|---|
+| Recording started | "Recording..." | — |
+| BLE advertising | "BLE Active" | "N files XKB" |
+| Sync in progress | "Syncing..." | "X/Y files" |
+| Sync file acked | "Synced" | "X/Y synced" |
+| Status check (BtnPWR) | "N file(s)" | "X KB free" |
+| Oblique Strategy (BtnB long) | (word-wrapped strategy text) | — |
+| Power off | "Power Off" | — |
 
 ---
 
@@ -295,6 +354,35 @@ uv run python -m py_compile sync.py    # syntax check
   app converts M4A → WAV in memory (`AudioEncoder.m4aToWav()`) before sending,
   because custom Whisper-compatible servers typically expect `audio/wav`. The
   built-in OpenAI and ElevenLabs providers send M4A directly.
+
+---
+
+## PTT recording via Tasker
+
+The app can record audio directly from the phone's microphone (or a USB
+microphone if one is attached), controlled by Tasker intents:
+
+- **Start**: Tasker sends broadcast `com.middle.app.ACTION_PTT_START`
+- **Stop**: Tasker sends broadcast `com.middle.app.ACTION_PTT_STOP`
+
+`TaskerReceiver` forwards these intents to `SyncForegroundService`, which uses
+`AudioRecord` to capture 16 kHz mono PCM16 audio. On stop, the PCM is encoded
+to M4A via the existing `AudioEncoder.encodeToM4a()` and saved through
+`RecordingsRepository.savePcmRecording()`. The transcription and webhook
+pipeline runs identically to the BLE path.
+
+**USB microphone support**: before starting capture, the service queries
+`AudioManager.getDevices(GET_DEVICES_INPUTS)` for USB audio devices
+(`TYPE_USB_DEVICE` or `TYPE_USB_HEADSET`). If found, it calls
+`AudioRecord.setPreferredDevice()` to route audio to the USB mic. If no USB
+mic is present or the preference is rejected, the internal microphone is used
+silently.
+
+**Tasker setup** (example for volume-down PTT):
+- Profile: AutoInput — Key Down — Volume Down → Task: Send Intent
+  `com.middle.app.ACTION_PTT_START` (Broadcast Receiver)
+- Profile: AutoInput — Key Up — Volume Down → Task: Send Intent
+  `com.middle.app.ACTION_PTT_STOP` (Broadcast Receiver)
 
 ---
 

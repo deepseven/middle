@@ -17,7 +17,14 @@
     <!-- Foreground service for background BLE scanning -->
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_CONNECTED_DEVICE" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MICROPHONE" />
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+
+    <!-- Microphone for in-app PTT recording -->
+    <uses-permission android:name="android.permission.RECORD_AUDIO" />
+
+    <!-- Vibration feedback for PTT recording -->
+    <uses-permission android:name="android.permission.VIBRATE" />
 
     <!-- Network for OpenAI transcription -->
     <uses-permission android:name="android.permission.INTERNET" />
@@ -47,8 +54,17 @@
 
         <service
             android:name=".ble.SyncForegroundService"
-            android:foregroundServiceType="connectedDevice"
+            android:foregroundServiceType="connectedDevice|microphone"
             android:exported="false" />
+
+        <receiver
+            android:name=".TaskerReceiver"
+            android:exported="true">
+            <intent-filter>
+                <action android:name="com.middle.app.ACTION_PTT_START" />
+                <action android:name="com.middle.app.ACTION_PTT_STOP" />
+            </intent-filter>
+        </receiver>
 
         <provider
             android:name="androidx.core.content.FileProvider"

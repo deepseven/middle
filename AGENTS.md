@@ -27,7 +27,8 @@
 - **Two board environments exist** — pick the right one:
   - `esp32-s3-devkitc-1`: original dev-board (external INMP441 I2S mic).
   - `xiao_esp32s3_sense`: Seeed XIAO ESP32S3 Sense (built-in PDM mic, OLED).
-- Build firmware: `pio run -e esp32-s3-devkitc-1` (or `-e xiao_esp32s3_sense`).
+  - `m5stick_c_plus2`: M5StickC Plus2 (ESP32-PICO-V3-02, built-in PDM mic, TFT).
+- Build firmware: `pio run -e esp32-s3-devkitc-1` (or `-e xiao_esp32s3_sense` or `-e m5stick_c_plus2`).
 - Build and upload firmware over USB: `pio run -e <ENV> -t upload`.
 - Open serial monitor: `pio device monitor -b 115200`.
 - Upload filesystem image (LittleFS): `pio run -e <ENV> -t uploadfs`.
@@ -39,7 +40,7 @@
 ## static analysis and linting
 - There is no configured formatter or linter config checked into this repo.
 - Use PlatformIO static checks for firmware when needed:
-  - `pio check -e esp32-s3-devkitc-1` (or `xiao_esp32s3_sense`).
+  - `pio check -e esp32-s3-devkitc-1` (or `xiao_esp32s3_sense` or `m5stick_c_plus2`).
 - If you add a formatter or linter, document exact commands here.
 
 ## python script commands
@@ -144,7 +145,7 @@
 - If introducing a dependency, document why and how to run affected commands.
 
 ## validation checklist before finishing
-- Firmware compiles: `pio run -e esp32-s3-devkitc-1` and/or `pio run -e xiao_esp32s3_sense`.
+- Firmware compiles: `pio run -e esp32-s3-devkitc-1` and/or `pio run -e xiao_esp32s3_sense` and/or `pio run -e m5stick_c_plus2`.
 - If firmware protocol touched, verify matching constants in `sync.py`.
 - If python code touched, run `uv run python -m py_compile sync.py`.
 - If tests exist for touched area, run them.

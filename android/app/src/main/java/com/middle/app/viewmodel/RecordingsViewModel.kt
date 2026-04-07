@@ -1,6 +1,9 @@
 package com.middle.app.viewmodel
 
 import android.app.Application
+import android.content.ClipData
+import android.content.ClipboardManager
+import android.content.Context
 import android.media.MediaPlayer
 import android.util.Log
 import android.widget.Toast
@@ -140,7 +143,8 @@ class RecordingsViewModel(application: Application) : AndroidViewModel(applicati
                 val text = client.transcribe(recording.audioFile)
                 if (text != null) {
                     repository.saveTranscript(text, recording.audioFile)
-                    showToast("Transcription complete")
+                    copyToClipboard(text)
+                    showToast("Transcription copied to clipboard")
                 } else {
                     showToast("Transcription failed (${providerDisplayName(provider)})")
                 }
@@ -158,16 +162,22 @@ class RecordingsViewModel(application: Application) : AndroidViewModel(applicati
             val client = TranscriptionClient(provider, apiKey, settings.customSttUrl.trim())
             showToast("Transcribing ${toTranscribe.size} recording(s)…")
             var successCount = 0
+            val transcripts = mutableListOf<String>()
             for (recording in toTranscribe) {
                 try {
                     val text = client.transcribe(recording.audioFile)
                     if (text != null) {
                         repository.saveTranscript(text, recording.audioFile)
                         successCount++
+                        val trimmed = text.trim()
+                        if (trimmed.isNotEmpty()) transcripts.add(trimmed)
                     }
                 } catch (exception: Exception) {
                     Log.e(TAG, "Transcription failed for ${recording.audioFile.name}: $exception")
                 }
+            }
+            if (transcripts.isNotEmpty()) {
+                copyToClipboard(transcripts.joinToString("\n\n"))
             }
             showToast("Transcribed $successCount of ${toTranscribe.size}")
         }
@@ -209,6 +219,17 @@ class RecordingsViewModel(application: Application) : AndroidViewModel(applicati
     override fun onCleared() {
         super.onCleared()
         stopPlayback()
+    }
+
+    private suspend fun copyToClipboard(text: String) {
+        withContext(Dispatchers.Main) {
+            try {
+                val clipboard = getApplication<Application>().getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
+                clipboard.setPrimaryClip(ClipData.newPlainText("Transcription", text))
+            } catch (exception: Exception) {
+                Log.w(TAG, "Clipboard copy failed: $exception")
+            }
+        }
     }
 
     private suspend fun showToast(message: String) {

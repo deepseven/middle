@@ -4,12 +4,16 @@ import android.util.Log
 import com.middle.app.audio.AudioEncoder
 import com.middle.app.data.Settings
 import com.middle.app.data.WebhookLog
+import okhttp3.Headers
+import okhttp3.MediaType
 import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.MultipartBody
 import okhttp3.OkHttpClient
 import okhttp3.Request
+import okhttp3.RequestBody
 import okhttp3.RequestBody.Companion.asRequestBody
 import okhttp3.RequestBody.Companion.toRequestBody
+import okio.BufferedSink
 import org.json.JSONObject
 import java.io.File
 import java.util.concurrent.TimeUnit
@@ -44,6 +48,7 @@ class TranscriptionClient(
             .setType(MultipartBody.FORM)
             .addFormDataPart("model", OPENAI_TRANSCRIPTION_MODEL)
             .addFormDataPart("response_format", "json")
+            .addFormDataPart("language", "en")
             .addFormDataPart(
                 "file",
                 audioFile.name,
@@ -80,6 +85,7 @@ class TranscriptionClient(
         val requestBody = MultipartBody.Builder()
             .setType(MultipartBody.FORM)
             .addFormDataPart("model_id", ELEVENLABS_TRANSCRIPTION_MODEL)
+            .addFormDataPart("language_code", "eng")
             .addFormDataPart(
                 "file",
                 audioFile.name,
@@ -129,18 +135,37 @@ class TranscriptionClient(
         }
 
         val wavMime = "audio/wav".toMediaType()
+        val language = "en"
+
+        // Build multipart body using addPart() with explicit headers instead
+        // of addFormDataPart() for text fields.  OkHttp's addFormDataPart()
+        // adds a per-part Content-Length header that Python's `requests`
+        // library omits.  Some Whisper server implementations misparse
+        // form fields when per-part Content-Length is present.
+        val textFields = listOf(
+            "model" to CUSTOM_TRANSCRIPTION_MODEL,
+            "response_format" to "json",
+            "language" to language,
+            "temperature" to "0",
+        )
         val bodyBuilder = MultipartBody.Builder()
             .setType(MultipartBody.FORM)
-            .addFormDataPart("model", CUSTOM_TRANSCRIPTION_MODEL)
-            .addFormDataPart("response_format", "json")
-            .addFormDataPart("temperature", "0")
-            .addFormDataPart(
-                "file",
-                "audio.wav",
-                wavBytes.toRequestBody(wavMime),
+        for ((name, value) in textFields) {
+            bodyBuilder.addPart(
+                Headers.headersOf("Content-Disposition", "form-data; name=\"$name\""),
+                noLengthBody(value),
             )
+        }
+        bodyBuilder.addFormDataPart(
+            "file",
+            "audio.wav",
+            wavBytes.toRequestBody(wavMime),
+        )
 
-        Log.d(TAG, "Custom STT request: url=$customUrl wavSize=${wavBytes.size} (from ${audioFile.name} ${audioFile.length()} bytes)")
+        Log.d(TAG, "Custom STT request: url=$customUrl language=$language wavSize=${wavBytes.size} (from ${audioFile.name} ${audioFile.length()} bytes)")
+        for ((name, value) in textFields) {
+            Log.d(TAG, "  form field: $name=$value")
+        }
 
         return try {
             val requestBuilder = Request.Builder()
@@ -189,6 +214,18 @@ class TranscriptionClient(
             WebhookLog.error(message)
             null
         }
+    }
+
+    /**
+     * A [RequestBody] for a plain-text value that reports unknown content
+     * length (-1).  This prevents OkHttp from adding a per-part
+     * Content-Length header in the multipart body, matching the encoding
+     * produced by Python's `requests` library.
+     */
+    private fun noLengthBody(value: String): RequestBody = object : RequestBody() {
+        override fun contentType(): MediaType? = null
+        override fun contentLength(): Long = -1L
+        override fun writeTo(sink: BufferedSink) { sink.writeUtf8(value) }
     }
 
     companion object {

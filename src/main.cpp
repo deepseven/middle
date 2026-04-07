@@ -1,4 +1,5 @@
 #include <Arduino.h>
+#include <BLE2902.h>
 #include <BLEDevice.h>
 #include <BLEServer.h>
 #include <BLEUtils.h>
@@ -7,6 +8,9 @@
 #include <driver/i2s_pdm.h>
 #include <U8g2lib.h>
 #include <Wire.h>
+#elif defined(BOARD_M5STICKCPLUS2)
+#include <driver/i2s_pdm.h>
+#include <TFT_eSPI.h>
 #else
 #include <driver/i2s_std.h>
 #endif
@@ -18,8 +22,13 @@
 // BLE wrapper calls ble_gatts_notify_custom but silently aborts on non-zero
 // return (e.g. BLE_HS_ENOMEM when the mbuf pool is exhausted). We call it
 // ourselves so we can retry instead of losing data.
+//
+// On ESP32 (original) the Arduino framework uses BlueDroid instead of NimBLE,
+// so these headers are only available on NimBLE-enabled targets.
+#if CONFIG_BT_NIMBLE_ENABLED
 #include <host/ble_gatt.h>
 #include <host/ble_hs_mbuf.h>
+#endif
 #include <nvs.h>
 #include <nvs_flash.h>
 
@@ -37,6 +46,16 @@ static const int pin_button = 2;   // D1 on XIAO expansion board
 // PDM microphone pins (internal to Sense board).
 static const int pin_pdm_clk = 42;
 static const int pin_pdm_data = 41;
+#elif defined(BOARD_M5STICKCPLUS2)
+// M5StickC Plus2 pin mapping.
+static const int pin_button = 37;       // BtnA (front button), active LOW
+static const int pin_button_b = 39;     // BtnB (side button), active LOW
+static const int pin_button_pwr = 35;   // Power button, active LOW
+static const int pin_power_hold = 4;    // Hold HIGH to keep device powered
+static const int pin_battery = 38;      // Battery voltage via 1:1 divider (ADC1)
+// SPM1423 PDM microphone pins (built into device).
+static const int pin_pdm_clk = 0;
+static const int pin_pdm_data = 34;
 #else
 static const int pin_button = 2;
 static const int pin_battery = 1;
@@ -54,6 +73,33 @@ static U8G2_SSD1306_128X64_NONAME_F_HW_I2C oled(U8G2_R0, U8X8_PIN_NONE);
 static bool oled_ready = false;
 #endif
 
+// TFT display on M5StickC Plus2 (ST7789V2 135x240 SPI).
+#ifdef BOARD_M5STICKCPLUS2
+static TFT_eSPI tft = TFT_eSPI();
+static bool tft_ready = false;
+#endif
+
+// Display auto-off to save power. After any display update the screen stays
+// on for display_timeout_ms then turns off automatically.
+#if defined(BOARD_XIAO_SENSE) || defined(BOARD_M5STICKCPLUS2)
+static const unsigned long display_timeout_ms = 3000;
+static unsigned long display_off_at_ms = 0;
+static bool display_is_on = false;
+#endif
+
+// Forward declaration so display helpers can read battery voltage.
+static uint16_t read_battery_millivolts();
+
+// Battery voltage range for percentage calculation (millivolts).
+// These depend on cell chemistry and board circuitry.
+#if defined(BOARD_M5STICKCPLUS2)
+static const uint16_t bat_mv_empty = 3300;  // 120 mAh LiPo, cut-off ~3.3 V
+static const uint16_t bat_mv_full  = 4200;  // Fully charged Li-ion/LiPo
+#elif !defined(BOARD_XIAO_SENSE)
+static const uint16_t bat_mv_empty = 3300;  // DevKitC external Li-ion cell
+static const uint16_t bat_mv_full  = 4200;
+#endif
+
 static const int sample_rate = 16000;
 static const unsigned long minimum_recording_milliseconds = 1000;
 
@@ -65,6 +111,10 @@ static const size_t i2s_startup_discard_samples = 1600;
 // Software gain for the XIAO Sense's built-in PDM mic, which produces
 // lower-amplitude samples than the INMP441.  Expressed as a left-shift
 // count: 2 = 4x gain.  Increase to 3 (8x) if still too quiet.
+static const int pdm_gain_shift = 3;
+#elif defined(BOARD_M5STICKCPLUS2)
+// Software gain for the M5StickC Plus2's SPM1423 PDM mic.
+// 8x gain (shift 3).
 static const int pdm_gain_shift = 3;
 #endif
 
@@ -262,6 +312,7 @@ static void command_queue_clear() {
 static volatile bool client_connected = false;
 static volatile bool connection_authenticated = false;
 static volatile uint16_t pending_recording_count = 0;
+static uint16_t sync_total_files = 0;
 static volatile bool sleep_requested = false;
 static bool littlefs_ready = false;
 static bool littlefs_mount_attempted = false;
@@ -292,10 +343,15 @@ static void oled_init() {
 
 static void oled_show(const char *line1, const char *line2 = nullptr) {
   if (!oled_ready) return;
+  if (!display_is_on) {
+    oled.setPowerSave(0);
+    display_is_on = true;
+  }
   oled.clearBuffer();
   if (line1) oled.drawStr(0, 24, line1);
   if (line2) oled.drawStr(0, 48, line2);
   oled.sendBuffer();
+  display_off_at_ms = millis() + display_timeout_ms;
 }
 
 static void oled_off() {
@@ -303,7 +359,229 @@ static void oled_off() {
   oled.clearBuffer();
   oled.sendBuffer();
   oled.setPowerSave(1);
+  display_is_on = false;
 }
+#endif
+
+#ifdef BOARD_M5STICKCPLUS2
+static void tft_init() {
+  pinMode(TFT_BL, OUTPUT);
+  digitalWrite(TFT_BL, LOW);   // Backlight off during init to hide artifacts
+  tft.init();
+  tft.setRotation(3);  // Landscape: 240x135, M5 button on the left
+  tft.fillScreen(TFT_BLACK);
+  tft.setTextColor(TFT_WHITE, TFT_BLACK);
+  tft.setTextSize(2);
+  // Don't turn backlight on yet — let tft_show() handle it when there
+  // is actually content to display. Avoids a flash on cold boot.
+  display_is_on = false;
+  tft_ready = true;
+}
+
+// Draw a small battery percentage in the bottom-right corner of the TFT.
+// Uses text size 1 (6x8 px) to stay unobtrusive.
+static void tft_draw_battery() {
+  uint16_t mv = read_battery_millivolts();
+  if (mv == 0) return;
+  int pct = (int)((mv - bat_mv_empty) * 100 / (bat_mv_full - bat_mv_empty));
+  if (pct < 0) pct = 0;
+  if (pct > 100) pct = 100;
+  char bat[8];
+  snprintf(bat, sizeof(bat), "%d%%", pct);
+  tft.setTextSize(1);
+  tft.setTextColor(TFT_DARKGREY, TFT_BLACK);
+  tft.drawString(bat, 240 - strlen(bat) * 6 - 4, 135 - 10);
+  tft.setTextSize(2);
+  tft.setTextColor(TFT_WHITE, TFT_BLACK);
+}
+
+static void tft_show(const char *line1, const char *line2 = nullptr) {
+  if (!tft_ready) return;
+  if (!display_is_on) {
+    tft.writecommand(0x11);  // SLPOUT
+    delay(5);
+    digitalWrite(TFT_BL, HIGH);
+    display_is_on = true;
+  }
+  tft.fillScreen(TFT_BLACK);
+  if (line1) tft.drawString(line1, 10, 30);
+  if (line2) tft.drawString(line2, 10, 70);
+  tft_draw_battery();
+  display_off_at_ms = millis() + display_timeout_ms;
+}
+
+static void tft_off() {
+  if (!tft_ready) return;
+  tft.fillScreen(TFT_BLACK);
+  digitalWrite(TFT_BL, LOW);
+  tft.writecommand(0x10);  // ST7789 SLPIN (enter sleep mode)
+  display_is_on = false;
+}
+
+// Word-wrapping text display for longer messages (e.g. oblique strategies).
+// Renders text at the given text size, breaking at word boundaries.
+static void tft_show_wrapped(const char *text, uint8_t size = 2) {
+  if (!tft_ready) return;
+  if (!display_is_on) {
+    tft.writecommand(0x11);  // SLPOUT
+    delay(5);
+    digitalWrite(TFT_BL, HIGH);
+    display_is_on = true;
+  }
+  tft.fillScreen(TFT_BLACK);
+  tft.setTextSize(size);
+  int char_w = 6 * size;
+  int line_h = 8 * size + 2;
+  int max_chars = (240 - 10) / char_w;
+  int y = 10;
+  const char *p = text;
+  while (*p && y + line_h <= 135) {
+    int len = strlen(p);
+    int line_len = (len <= max_chars) ? len : max_chars;
+    if (len > max_chars) {
+      int last_space = -1;
+      for (int i = 0; i < line_len; i++) {
+        if (p[i] == ' ') last_space = i;
+      }
+      if (last_space > 0) line_len = last_space;
+    }
+    char line_buf[42];
+    int copy_len = (line_len < (int)sizeof(line_buf) - 1) ? line_len : (int)sizeof(line_buf) - 1;
+    memcpy(line_buf, p, copy_len);
+    line_buf[copy_len] = '\0';
+    tft.drawString(line_buf, 5, y);
+    y += line_h;
+    p += line_len;
+    while (*p == ' ') p++;
+  }
+  tft.setTextSize(2);
+  display_off_at_ms = millis() + display_timeout_ms;
+}
+
+static const char *const oblique_strategies[] = {
+  "A line has two sides",
+  "Abandon desire",
+  "Abandon normal instructions",
+  "Accept advice",
+  "Adding on",
+  "Always the first steps",
+  "Ask people to work against their better judgement",
+  "Ask your body",
+  "Be dirty",
+  "Be extravagant",
+  "Be less critical",
+  "Breathe more deeply",
+  "Bridges -build -burn",
+  "Change ambiguities to specifics",
+  "Change nothing and continue consistently",
+  "Change specifics to ambiguities",
+  "Consider transitions",
+  "Courage!",
+  "Cut a vital connection",
+  "Decorate",
+  "Destroy nothing; Destroy the most important thing",
+  "Discard an axiom",
+  "Disciplined self-indulgence",
+  "Discover your formulas and abandon them",
+  "Display your talent",
+  "Distort time",
+  "Do nothing for as long as possible",
+  "Do something boring",
+  "Do something sudden",
+  "Do the last thing first",
+  "Do the words need changing?",
+  "Don't avoid what is easy",
+  "Don't break the silence",
+  "Don't stress one thing more than another",
+  "Emphasize differences",
+  "Emphasize the flaws",
+  "Faced with a choice, do both",
+  "Find a safe part and use it as an anchor",
+  "Give the game away",
+  "Give way to your worst impulse",
+  "Go outside. Shut the door.",
+  "Go to an extreme, move back to a more comfortable place",
+  "Honor thy error as a hidden intention",
+  "How would someone else do it?",
+  "How would you have done it?",
+  "In total darkness, or in a very large room, very quietly",
+  "Is it finished?",
+  "Is something missing?",
+  "Is the style right?",
+  "It is simply a matter of work",
+  "Just carry on",
+  "Listen to the quiet voice",
+  "Look at the order in which you do things",
+  "Magnify the most difficult details",
+  "Make it more sensual",
+  "Make what's perfect more human",
+  "Move towards the unimportant",
+  "Not building a wall; making a brick",
+  "Once the search has begun, something will be found",
+  "Only a part, not the whole",
+  "Only one element of each kind",
+  "Openly resist change",
+  "Question the heroic",
+  "Remember quiet evenings",
+  "Remove a restriction",
+  "Repetition is a form of change",
+  "Retrace your steps",
+  "Reverse",
+  "Simple subtraction",
+  "Slow preparation, fast execution",
+  "State the problem as clearly as possible",
+  "Take a break",
+  "Take away the important parts",
+  "The inconsistency principle",
+  "The most easily forgotten thing is the most important",
+  "Think - inside the work - outside the work",
+  "Tidy up",
+  "Try faking it",
+  "Turn it upside down",
+  "Use an old idea",
+  "Use cliches",
+  "Use filters",
+  "Use something nearby as a model",
+  "Use your own ideas",
+  "Voice your suspicions",
+  "Water",
+  "What context would look right?",
+  "What is the simplest solution?",
+  "What mistakes did you make last time?",
+  "What to increase? What to reduce?",
+  "What were you really thinking about just now?",
+  "What would your closest friend do?",
+  "What wouldn't you do?",
+  "When is it for?",
+  "Where is the edge?",
+  "Which parts can be grouped?",
+  "Work at a different speed",
+  "Would anyone want it?",
+  "Your mistake was a hidden intention",
+};
+static const int oblique_strategy_count =
+    sizeof(oblique_strategies) / sizeof(oblique_strategies[0]);
+
+static void show_oblique_strategy() {
+  uint32_t index = esp_random() % oblique_strategy_count;
+  tft_show_wrapped(oblique_strategies[index]);
+  // Give more time to read the strategy text.
+  display_off_at_ms = millis() + 15000;
+}
+#endif
+
+// Turn off the display if the auto-off timer has expired.
+#if defined(BOARD_XIAO_SENSE) || defined(BOARD_M5STICKCPLUS2)
+static void display_check_timeout() {
+  if (display_is_on && (long)(millis() - display_off_at_ms) >= 0) {
+#ifdef BOARD_XIAO_SENSE
+    oled_off();
+#else
+    tft_off();
+#endif
+  }
+}
+
 #endif
 
 static void set_status_led_off() {
@@ -321,6 +599,10 @@ static bool ble_window_active() {
   return (long)(ble_active_until_milliseconds - millis()) > 0;
 }
 
+#if defined(BOARD_XIAO_SENSE) || defined(BOARD_M5STICKCPLUS2)
+static uint32_t free_storage_kb();
+#endif
+
 static void start_ble_advertising() {
   if (ble_advertising == nullptr) {
     return;
@@ -332,9 +614,16 @@ static void start_ble_advertising() {
   }
 #ifdef BOARD_XIAO_SENSE
   char buf[22];
-  snprintf(buf, sizeof(buf), "%u file(s)", (unsigned)pending_recording_count);
+  snprintf(buf, sizeof(buf), "%u files %luKB",
+           (unsigned)pending_recording_count, (unsigned long)free_storage_kb());
   oled_show("BLE Active", buf);
+#elif defined(BOARD_M5STICKCPLUS2)
+  char buf[22];
+  snprintf(buf, sizeof(buf), "%u files %luKB",
+           (unsigned)pending_recording_count, (unsigned long)free_storage_kb());
+  tft_show("BLE Active", buf);
 #endif
+  sync_total_files = pending_recording_count;
 }
 
 // Restarts advertising after a disconnect without touching either sleep timer.
@@ -351,21 +640,37 @@ static void resume_ble_advertising() {
 }
 
 static void configure_button_wakeup() {
+#ifdef BOARD_M5STICKCPLUS2
+  // ext0 for BtnA (record), ext1 for BtnPWR (status check).
+  // ESP32 ext1 only supports ALL_LOW, but with a single-pin mask that
+  // behaves like "wake when this pin goes LOW".
   esp_sleep_enable_ext0_wakeup((gpio_num_t)pin_button, 0);
+  esp_sleep_enable_ext1_wakeup(1ULL << pin_button_pwr, ESP_EXT1_WAKEUP_ALL_LOW);
+#else
+  esp_sleep_enable_ext0_wakeup((gpio_num_t)pin_button, 0);
+#ifndef BOARD_XIAO_SENSE
   rtc_gpio_pullup_en((gpio_num_t)pin_button);
   rtc_gpio_pulldown_dis((gpio_num_t)pin_button);
+#endif
+#endif
 }
 
 static void enter_deep_sleep() {
   set_status_led_off();
 #ifdef BOARD_XIAO_SENSE
   oled_off();
+#elif defined(BOARD_M5STICKCPLUS2)
+  tft_off();
 #endif
   if (ble_advertising != nullptr) {
     ble_advertising->stop();
   }
   delay(20);
-#ifndef BOARD_XIAO_SENSE
+#ifdef BOARD_M5STICKCPLUS2
+  // Keep the power hold pin HIGH during deep sleep so the device stays on.
+  gpio_hold_en((gpio_num_t)pin_power_hold);
+  gpio_deep_sleep_hold_en();
+#elif !defined(BOARD_XIAO_SENSE)
   // Hold the mic power pin LOW during deep sleep so the INMP441's internal
   // pull-up cannot draw current while the chip is sleeping.
   gpio_hold_en((gpio_num_t)pin_mic_power);
@@ -477,6 +782,27 @@ static int count_recordings() {
   return count;
 }
 
+#if defined(BOARD_XIAO_SENSE) || defined(BOARD_M5STICKCPLUS2)
+static uint32_t free_storage_kb() {
+  if (!ensure_littlefs_ready()) return 0;
+  return (LittleFS.totalBytes() - LittleFS.usedBytes()) / 1024;
+}
+
+static void show_status_screen() {
+  if (!ensure_littlefs_ready()) return;
+  int files = count_recordings();
+  uint32_t free_kb = free_storage_kb();
+  char line1[22], line2[22];
+  snprintf(line1, sizeof(line1), "%d file(s)", files);
+  snprintf(line2, sizeof(line2), "%lu KB free", (unsigned long)free_kb);
+#ifdef BOARD_XIAO_SENSE
+  oled_show(line1, line2);
+#else
+  tft_show(line1, line2);
+#endif
+}
+#endif
+
 // Returns the path of the oldest recording (lowest numeric ID).
 static String next_recording_path() {
   if (!ensure_littlefs_ready()) {
@@ -515,7 +841,7 @@ static const size_t i2s_read_frames = 512;
 
 static i2s_chan_handle_t i2s_rx_channel = nullptr;
 
-#ifdef BOARD_XIAO_SENSE
+#if defined(BOARD_XIAO_SENSE) || defined(BOARD_M5STICKCPLUS2)
 static bool i2s_init() {
   i2s_chan_config_t channel_config = I2S_CHANNEL_DEFAULT_CONFIG(
       I2S_NUM_AUTO, I2S_ROLE_MASTER);
@@ -609,12 +935,14 @@ static bool record_and_save() {
 
 #ifdef BOARD_XIAO_SENSE
   oled_show("Recording...");
+#elif defined(BOARD_M5STICKCPLUS2)
+  tft_show("Recording...");
 #else
   digitalWrite(pin_mic_power, HIGH);
 #endif
 
   if (!i2s_init()) {
-#ifndef BOARD_XIAO_SENSE
+#if !defined(BOARD_XIAO_SENSE) && !defined(BOARD_M5STICKCPLUS2)
     digitalWrite(pin_mic_power, LOW);
 #endif
     return false;
@@ -654,7 +982,7 @@ static bool record_and_save() {
       break;
     }
 
-#ifdef BOARD_XIAO_SENSE
+#if defined(BOARD_XIAO_SENSE) || defined(BOARD_M5STICKCPLUS2)
     // PDM mode produces 16-bit mono samples directly.
     static int16_t i2s_buf[i2s_read_frames];
 #else
@@ -675,7 +1003,7 @@ static bool record_and_save() {
         DBG("[rec] i2s_channel_read error %d in discard loop\r\n", err);
         break;
       }
-#ifdef BOARD_XIAO_SENSE
+#if defined(BOARD_XIAO_SENSE) || defined(BOARD_M5STICKCPLUS2)
       discarded += bytes_read / sizeof(int16_t);
 #else
       discarded += bytes_read / sizeof(int32_t) / 2;
@@ -698,7 +1026,7 @@ static bool record_and_save() {
         break;
       }
 
-#ifdef BOARD_XIAO_SENSE
+#if defined(BOARD_XIAO_SENSE) || defined(BOARD_M5STICKCPLUS2)
       size_t total_samples = bytes_read / sizeof(int16_t);
       for (size_t i = 0; i < total_samples; i++) {
         int32_t amplified = (int32_t)i2s_buf[i] << pdm_gain_shift;
@@ -754,7 +1082,7 @@ static bool record_and_save() {
   } while (false);
 
   i2s_deinit();
-#ifndef BOARD_XIAO_SENSE
+#if !defined(BOARD_XIAO_SENSE) && !defined(BOARD_M5STICKCPLUS2)
   digitalWrite(pin_mic_power, LOW);
 #endif
   return recording_saved;
@@ -765,6 +1093,10 @@ static bool record_and_save() {
 // transient congestion. The Arduino BLE wrapper also calls this function
 // internally, but on any non-zero return it aborts the entire transfer —
 // which caused ~70% of file data to be silently lost during streaming.
+//
+// On BlueDroid (ESP32 original), the Arduino wrapper handles congestion via
+// an internal semaphore, so we fall back to the standard notify() call.
+#if CONFIG_BT_NIMBLE_ENABLED
 static bool send_notification(uint16_t connection_id, uint16_t attribute_handle,
                               uint8_t *data, int length) {
   for (int attempt = 0; attempt < 200; attempt++) {
@@ -786,6 +1118,20 @@ static bool send_notification(uint16_t connection_id, uint16_t attribute_handle,
   }
   return false;
 }
+#else
+static bool send_notification(uint16_t connection_id, uint16_t attribute_handle,
+                              uint8_t *data, int length) {
+  (void)connection_id;
+  (void)attribute_handle;
+  audio_data_characteristic->setValue(data, length);
+  audio_data_characteristic->notify();
+  // BlueDroid's notify() silently drops data when the TX queue is full.
+  // A brief delay after each notification gives the BLE controller time
+  // to transmit the packet before we enqueue the next one.
+  delay(8);
+  return true;
+}
+#endif
 
 // Opens the next recording file and sets file_info_characteristic so the
 // client can read the file size before streaming begins. The file handle is
@@ -877,11 +1223,18 @@ static void stream_prepared_file() {
 }
 
 static uint16_t read_battery_millivolts() {
-#ifdef BOARD_XIAO_SENSE
-  // The XIAO ESP32S3 does not expose battery voltage to any GPIO. No pin
-  // has an on-board voltage divider connected to the battery. Measuring
-  // the battery would require external wiring.
+#if defined(BOARD_XIAO_SENSE)
+  // XIAO Sense does not expose battery voltage to a GPIO.
   return 0;
+#elif defined(BOARD_M5STICKCPLUS2)
+  // GPIO38 through a 1:1 voltage divider (ratio 2.0x), same as M5Unified.
+  analogRead(pin_battery);
+  delayMicroseconds(100);
+  uint32_t sum = 0;
+  for (int i = 0; i < 10; i++) {
+    sum += analogReadMilliVolts(pin_battery);
+  }
+  return (uint16_t)((sum / 10) * 2);
 #else
   // Throwaway read to pre-charge the ADC's sample-and-hold capacitor,
   // which otherwise doesn't fully settle through the 180k voltage divider.
@@ -1034,13 +1387,19 @@ static void init_ble() {
   ble_server = BLEDevice::createServer();
   ble_server->setCallbacks(new server_callbacks());
 
-  BLEService *service = ble_server->createService(service_uuid);
+  BLEService *service = ble_server->createService(
+      BLEUUID(service_uuid), 20);
   file_count_characteristic = service->createCharacteristic(
       characteristic_file_count_uuid, BLECharacteristic::PROPERTY_READ);
   file_info_characteristic = service->createCharacteristic(
       characteristic_file_info_uuid, BLECharacteristic::PROPERTY_READ);
   audio_data_characteristic = service->createCharacteristic(
       characteristic_audio_data_uuid, BLECharacteristic::PROPERTY_NOTIFY);
+#if !CONFIG_BT_NIMBLE_ENABLED
+  // BlueDroid requires an explicit CCCD descriptor for notification
+  // characteristics. NimBLE adds it automatically.
+  audio_data_characteristic->addDescriptor(new BLE2902());
+#endif
 
   BLECharacteristic *command_characteristic = service->createCharacteristic(
       characteristic_command_uuid, BLECharacteristic::PROPERTY_WRITE);
@@ -1092,6 +1451,15 @@ void setup() {
   pinMode(pin_button, INPUT_PULLUP);
 #ifdef BOARD_XIAO_SENSE
   oled_init();
+#elif defined(BOARD_M5STICKCPLUS2)
+  // Release deep sleep hold before reconfiguring the power hold pin.
+  gpio_hold_dis((gpio_num_t)pin_power_hold);
+  gpio_deep_sleep_hold_dis();
+  pinMode(pin_power_hold, OUTPUT);
+  digitalWrite(pin_power_hold, HIGH);
+  pinMode(pin_button_b, INPUT);
+  pinMode(pin_button_pwr, INPUT);
+  tft_init();
 #else
   // Release the GPIO hold set in enter_deep_sleep() before reconfiguring the
   // pin. If the hold is still active, pinMode() fights the latched state.
@@ -1112,6 +1480,15 @@ void setup() {
       wakeup_cause != ESP_SLEEP_WAKEUP_EXT1) {
     enter_deep_sleep();
   }
+
+#ifdef BOARD_M5STICKCPLUS2
+  // Power button wakeup: show status and keep awake long enough for
+  // BtnB/BtnPWR handlers in loop() to work.
+  if (wakeup_cause == ESP_SLEEP_WAKEUP_EXT1) {
+    show_status_screen();
+    ble_active_until_milliseconds = millis() + display_timeout_ms;
+  }
+#endif
 
   remove_empty_recordings();
 
@@ -1150,10 +1527,20 @@ void loop() {
       prepare_current_file();
     } else if (command == command_start_stream) {
       stream_prepared_file();
+#if defined(BOARD_XIAO_SENSE) || defined(BOARD_M5STICKCPLUS2)
+      {
+        unsigned int sent = (sync_total_files > pending_recording_count)
+            ? sync_total_files - pending_recording_count + 1
+            : 1;
+        char sync_buf[22];
+        snprintf(sync_buf, sizeof(sync_buf), "%u/%u files",
+                 sent, (unsigned)sync_total_files);
 #ifdef BOARD_XIAO_SENSE
-      char sync_buf[22];
-      snprintf(sync_buf, sizeof(sync_buf), "%u left", (unsigned)pending_recording_count);
-      oled_show("Syncing...", sync_buf);
+        oled_show("Syncing...", sync_buf);
+#else
+        tft_show("Syncing...", sync_buf);
+#endif
+      }
 #endif
     } else if (command == command_ack_received) {
 
@@ -1180,12 +1567,28 @@ void loop() {
         }
       }
       update_file_count();
+#if defined(BOARD_XIAO_SENSE) || defined(BOARD_M5STICKCPLUS2)
+      {
+        unsigned int sent = (sync_total_files > pending_recording_count)
+            ? sync_total_files - pending_recording_count : sync_total_files;
+        char sync_buf[22];
+        snprintf(sync_buf, sizeof(sync_buf), "%u/%u synced",
+                 sent, (unsigned)sync_total_files);
+#ifdef BOARD_XIAO_SENSE
+        oled_show("Synced", sync_buf);
+#else
+        tft_show("Synced", sync_buf);
+#endif
+      }
+#endif
     } else if (command == command_sync_done) {
     } else if (command == command_enter_bootloader) {
       // Set the ROM download mode flag before restarting so the bootloader
       // stays in USB/UART download mode rather than booting the application.
       // This allows flashing without physical access to the boot button.
+#if defined(RTC_CNTL_OPTION1_REG)
       REG_WRITE(RTC_CNTL_OPTION1_REG, RTC_CNTL_FORCE_DOWNLOAD_BOOT);
+#endif
       esp_restart();
     }
   }
@@ -1202,6 +1605,67 @@ void loop() {
     sleep_requested = false;
     enter_deep_sleep();
   }
+
+#ifdef BOARD_M5STICKCPLUS2
+  // BtnB: short press = force BLE advertising, long press (>=1s) = oblique strategy.
+  static int last_btnb_state = HIGH;
+  static unsigned long btnb_press_start = 0;
+  static bool btnb_long_handled = false;
+  int btnb_state = digitalRead(pin_button_b);
+  if (btnb_state != last_btnb_state) {
+    last_btnb_state = btnb_state;
+    if (btnb_state == LOW) {
+      btnb_press_start = millis();
+      btnb_long_handled = false;
+    } else {
+      // Released — short press triggers sync if long press wasn't handled.
+      if (!btnb_long_handled) {
+        if (!ble_initialized) {
+          init_ble();
+          ble_initialized = true;
+        }
+        uint16_t millivolts = read_battery_millivolts();
+        voltage_characteristic->setValue(millivolts);
+        update_file_count();
+        sync_total_files = pending_recording_count;
+        start_ble_advertising();
+      }
+    }
+  }
+  if (btnb_state == LOW && !btnb_long_handled &&
+      (millis() - btnb_press_start >= 1000)) {
+    btnb_long_handled = true;
+    show_oblique_strategy();
+  }
+
+  // BtnPWR: short press = status screen, long press (>=2s) = power off.
+  static int last_pwr_state = HIGH;
+  static unsigned long pwr_press_start = 0;
+  static bool pwr_long_handled = false;
+  int pwr_state = digitalRead(pin_button_pwr);
+  if (pwr_state != last_pwr_state) {
+    last_pwr_state = pwr_state;
+    if (pwr_state == LOW) {
+      pwr_press_start = millis();
+      pwr_long_handled = false;
+      show_status_screen();
+      // Keep device awake while user is interacting.
+      ble_active_until_milliseconds = millis() + display_timeout_ms;
+    }
+  }
+  if (pwr_state == LOW && !pwr_long_handled &&
+      (millis() - pwr_press_start >= 2000)) {
+    pwr_long_handled = true;
+    tft_show("Power Off");
+    delay(500);
+    tft_off();
+    digitalWrite(pin_power_hold, LOW);
+  }
+#endif
+
+#if defined(BOARD_XIAO_SENSE) || defined(BOARD_M5STICKCPLUS2)
+  display_check_timeout();
+#endif
 
   delay(20);
 }

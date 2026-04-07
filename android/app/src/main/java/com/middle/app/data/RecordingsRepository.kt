@@ -44,6 +44,20 @@ class RecordingsRepository(context: Context) {
         return file
     }
 
+    /**
+     * Encode raw signed 16-bit LE PCM (mono, 16 kHz) to M4A and save to disk.
+     * Used by the PTT recording path which captures directly from the microphone.
+     */
+    suspend fun savePcmRecording(pcm16: ByteArray, filename: String): File {
+        val file = File(recordingsDirectory, filename)
+        withContext(Dispatchers.IO) {
+            AudioEncoder.encodeToM4a(pcm16, file)
+        }
+        Log.d(TAG, "[SyncDebug] savePcmRecording() output path=${file.absolutePath} size=${file.length()} bytes.")
+        refresh()
+        return file
+    }
+
     companion object {
         private const val TAG = "RecordingsRepo"
     }
