@@ -52,20 +52,24 @@ middle/
 ## Stack
 
 ### Firmware (`src/main.cpp`)
-- **Platform**: ESP32-S3 and ESP32 — three board variants:
+- **Platform**: ESP32-S3 and ESP32 — four board variants:
   - `esp32-s3-devkitc-1`: original dev-board with external INMP441 I2S mic
   - `xiao_esp32s3_sense` (XIAO ESP32S3 Sense): built-in PDM mic, SSD1306 OLED
     on expansion board, `BOARD_XIAO_SENSE` build flag
   - `m5stick_c_plus2` (M5StickC Plus2): ESP32-PICO-V3-02, built-in SPM1423
     PDM mic, ST7789V2 TFT display (135×240), `BOARD_M5STICKCPLUS2` build flag
+  - `m5stick_s3` (M5StickS3): ESP32-S3-PICO-1, built-in SPM1423 PDM mic,
+    ST7789V2 TFT display (135×240) via M5Unified/M5GFX, PY32 PMIC for
+    battery management, `BOARD_M5STICKS3` build flag — always-on power model
+    (see `HOW-TO-M5STICKS3.md` for details)
 - **Framework**: Arduino via PlatformIO (`platformio.ini`)
 - **BLE**: Arduino BLE wrapper over NimBLE; `ble_gatts_notify_custom()` called
   directly to enable retry on mbuf exhaustion (the Arduino wrapper aborts on
   non-zero return, causing ~70–80% data loss).
 - **Storage**: LittleFS (~3 MB partition, `huge_app.csv`)
 - **Audio**: INMP441 I2S MEMS mic (devkit), built-in PDM mic (XIAO Sense /
-  M5StickC Plus2, with configurable software gain via `pdm_gain_shift`);
-  IMA ADPCM encoding at 16 kHz mono (~4 KB/s)
+  M5StickC Plus2 / M5StickS3, with configurable software gain via
+  `pdm_gain_shift`); IMA ADPCM encoding at 16 kHz mono (~4 KB/s)
 - **Concurrency**: FreeRTOS — sampling loop on core 1, flash writer task on core 0
 
 ### Host sync script (`sync.py`)
@@ -106,7 +110,7 @@ middle/
 | Voltage      | `0005` | Read        | Battery millivolts (uint16 LE); optional — older firmware may omit it |
 | Pairing      | `0006` | Read+Write  | Ownership token: read returns 0x00 (unclaimed) or 0x01 (claimed); write sends 16-byte token |
 
-**Commands**: `REQUEST_NEXT=0x01`, `ACK_RECEIVED=0x02`, `SYNC_DONE=0x03`, `START_STREAM=0x04`
+**Commands**: `REQUEST_NEXT=0x01`, `ACK_RECEIVED=0x02`, `SYNC_DONE=0x03`, `START_STREAM=0x04`, `ENTER_BOOTLOADER=0x05`, `SKIP_FILE=0x06`, `UNPAIR=0x07`
 
 **MTU**: Firmware requests 517; chunk size = MTU − 3 (ATT header overhead).
 
@@ -120,6 +124,13 @@ middle/
 7. Phone writes `ACK_RECEIVED`; firmware deletes the file from flash.
 8. Repeat for each file.
 9. Phone writes `SYNC_DONE` when all files are done.
+
+**Partial transfer recovery**: if a file fails to transfer after 3 attempts
+(e.g., BlueDroid silently dropped notifications), the phone saves whatever partial
+data it received as a broken recording (IMA ADPCM decoded to M4A if possible, raw
+`.ima` otherwise), then writes `SKIP_FILE` to delete the file from the pendant and
+continues to the next file. This prevents untransferable files from permanently
+blocking the sync queue.
 
 **Retry**: up to 3 attempts per file on timeout; firmware retries each notification
 up to 200 times (5 ms delay) on mbuf exhaustion.
@@ -137,6 +148,29 @@ buffer size hasn't grown in two consecutive polls (6 s of no data), the transfer
 is considered stalled and retried immediately. This reduces worst-case stall
 recovery from 120 s to ~6 s per attempt.
 
+**Background scanning strategy**: the Android app uses two distinct scanning
+modes depending on `AppVisibility`:
+
+- **Foreground** (`AppVisibility.isForeground == true`): callback-based
+  `SCAN_MODE_LOW_LATENCY` scan with a 2 s window / 3 s period. This provides
+  instant detection when the user has the app open.
+
+- **Background** (`AppVisibility.isForeground == false`): `PendingIntent`-based
+  `SCAN_MODE_LOW_POWER` scan. Android offloads the filter matching to the
+  Bluetooth controller hardware — the main CPU stays asleep and the BT chip
+  autonomously watches for advertisements matching the filter (paired MAC or
+  service UUID). When a match occurs, Android delivers the `ScanResult` via a
+  `PendingIntent` targeting `SyncForegroundService` (action
+  `ACTION_BG_SCAN_RESULT`), which then starts the sync. This survives Doze
+  mode and App Standby with near-zero battery impact — comparable to simply
+  having Bluetooth enabled.
+
+**Wake lock during sync**: when `syncWithDevice()` starts, the service acquires
+a `PARTIAL_WAKE_LOCK` (tag `Middle::BleSync`, 5-minute safety timeout) to
+prevent the CPU from sleeping during the GATT connection and data transfer.
+The lock is released in the `finally` block after disconnect, ensuring the
+CPU is only held awake for the actual transfer duration.
+
 **In-app BLE logging**: key sync lifecycle events (connect, file count, transfer
 progress, stall/timeout, retry, completion, failure) are published to
 `WebhookLog`, making them visible on the app's Log screen alongside webhook
@@ -151,8 +185,11 @@ Pendant microphone (BLE path)
 ├─ DevKit path:  INMP441 (I2S, 32-bit stereo) → left channel >> 16 → int16 PCM
 ├─ XIAO path:    Built-in PDM mic (GPIO 42 clk / GPIO 41 data) → int16 PCM
 │                → software gain (pdm_gain_shift, default 8× with clamp)
-└─ M5Stick path: SPM1423 PDM mic (GPIO 0 clk / GPIO 34 data) → int16 PCM
+├─ M5StickC Plus2 path: SPM1423 PDM mic (GPIO 0 clk / GPIO 34 data) → int16 PCM
+│                → software gain (pdm_gain_shift, default 8× with clamp)
+└─ M5StickS3 path: SPM1423 PDM mic (GPIO 0 clk / GPIO 1 data) → int16 PCM
                  → software gain (pdm_gain_shift, default 8× with clamp)
+                 → M5Unified told not to touch I2S (cfg.internal_mic = false)
   → IMA ADPCM encoder (firmware, src/main.cpp)
   → packed nibbles in LittleFS (.ima file, 4-byte sample-count header)
   → BLE notify stream
@@ -189,12 +226,13 @@ a sync-only tap gesture).
 
 ### Display auto-off
 
-Boards with a display (XIAO Sense OLED, M5StickC Plus2 TFT) use a 3-second
-auto-off timer. After any display update the timer resets; when it expires the
-firmware turns the display off (OLED enters power-save mode, TFT enters sleep
-mode and the backlight (GPIO 27) goes LOW). This keeps screen-on time minimal
-during recording — the screen shows "Recording..." once at the start and then
-auto-offs after 3 seconds while recording continues.
+Boards with a display (XIAO Sense OLED, M5StickC Plus2 TFT, M5StickS3 TFT)
+use a 3-second auto-off timer. After any display update the timer resets;
+when it expires the firmware turns the display off (OLED enters power-save
+mode, TFT enters sleep mode and the backlight goes LOW, M5StickS3 calls
+`M5.Display.sleep()`). This keeps screen-on time minimal during recording —
+the screen shows "Recording..." once at the start and then auto-offs after
+3 seconds while recording continues.
 
 ### Buttons (M5StickC Plus2)
 
@@ -203,6 +241,17 @@ auto-offs after 3 seconds while recording continues.
 | BtnA (front) | 37 | Start recording (hold to record, release to stop) | — |
 | BtnB (side) | 39 | Force BLE advertising (manual sync trigger) | Show random Oblique Strategy (≥ 1 s) |
 | BtnPWR (right) | 35 | Show status screen (file count + free KB) | Power off (≥ 2 s, releases GPIO 4 power hold) |
+
+### Buttons (M5StickS3)
+
+M5StickS3 uses M5Unified's button API (`M5.BtnA`, `M5.BtnB`) instead of
+direct `digitalRead()`. `M5.update()` is called each loop iteration.
+
+| Button | GPIO | Short press | Long press |
+|---|---|---|---|
+| BtnA (front) | 35 | Record (hold to record, release to stop) | — |
+| BtnB (side) | 37 | Force BLE advertising | Show random Oblique Strategy (≥ 1 s) |
+| Power (hardware) | — | Power on | Power off (≥ 6 s, hardware-managed) |
 
 BtnA and BtnPWR are deep-sleep wakeup sources (ext0 and ext1 respectively).
 Waking via BtnPWR shows the status screen and enters the main loop with a
@@ -398,9 +447,7 @@ silently.
 - **`backgroundSyncEnabled` setting is stored but not enforced**: `Settings.kt`
   exposes the toggle and `SettingsScreen.kt` renders it, but
   `SyncForegroundService` does not read it — the service always scans regardless
-  of the toggle value. Both foreground and background scan profiles use
-  `SCAN_MODE_LOW_LATENCY`; the only difference is the period (3 s foreground,
-  3 s background — currently identical). Constants live in `BleConstants.kt`.
+  of the toggle value.
 - **ExoPlayer dependency is declared but unused**: `media3-exoplayer:1.2.1` is in
   `build.gradle.kts` but playback uses `MediaPlayer` directly in
   `RecordingsViewModel.kt`.

@@ -26,6 +26,9 @@
     <!-- Vibration feedback for PTT recording -->
     <uses-permission android:name="android.permission.VIBRATE" />
 
+    <!-- Wake lock for keeping CPU alive during active BLE sync transfer -->
+    <uses-permission android:name="android.permission.WAKE_LOCK" />
+
     <!-- Network for OpenAI transcription -->
     <uses-permission android:name="android.permission.INTERNET" />
 

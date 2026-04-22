@@ -207,15 +207,26 @@ class PendantBleManager(context: Context) : BleManager(context) {
     }
 
     /**
+     * Result of a file transfer attempt. [data] contains the complete file if
+     * the transfer succeeded, or null if it failed. [partialData] contains
+     * whatever partial bytes were received during the last failed attempt (may
+     * be empty). When [data] is null the caller should save [partialData] as a
+     * broken recording and send SKIP_FILE to delete the file from the pendant.
+     */
+    data class TransferResult(val data: ByteArray?, val partialData: ByteArray?)
+
+    /**
      * Request and download one file from the pendant. Resets the internal
      * buffer and deferred for each attempt without toggling CCCD — the
      * notification subscription is managed at session level by
      * enableAudioNotifications() / disableAudioNotifications().
      *
-     * Returns the raw IMA ADPCM file data (header + payload), or null if
-     * the file is empty (corrupt or aborted recording).
+     * Returns a [TransferResult] with the raw IMA ADPCM file data on success,
+     * or partial data on failure. Returns data=null, partialData=null if the
+     * file is empty (corrupt or aborted recording).
      */
-    suspend fun requestNextFile(): ByteArray? {
+    suspend fun requestNextFile(): TransferResult {
+        var lastPartialData: ByteArray? = null
         for (attempt in 1..MAX_FILE_TRANSFER_ATTEMPTS) {
             if (attempt > 1) {
                 Log.w(TAG, "Retrying file transfer (attempt $attempt/$MAX_FILE_TRANSFER_ATTEMPTS).")
@@ -244,7 +255,7 @@ class PendantBleManager(context: Context) : BleManager(context) {
                 if (expectedSize == 0) {
                     Log.w(TAG, "File is empty, skipping.")
                     WebhookLog.info("BLE: file empty, skipping")
-                    return null
+                    return TransferResult(null, null)
                 }
 
                 // Update expectedSize in the active state so the callback can
@@ -253,7 +264,7 @@ class PendantBleManager(context: Context) : BleManager(context) {
 
                 // If chunks arrived before we updated expectedSize, check now.
                 if (buffer.size() >= expectedSize) {
-                    return buffer.toByteArray().copyOfRange(0, expectedSize)
+                    return TransferResult(buffer.toByteArray().copyOfRange(0, expectedSize), null)
                 }
 
                 // Tell the firmware to begin the notification stream now that
@@ -269,19 +280,23 @@ class PendantBleManager(context: Context) : BleManager(context) {
                 )
                 if (result != null) {
                     WebhookLog.info("BLE: received ${result.size} bytes")
-                    return result.copyOfRange(0, expectedSize)
+                    return TransferResult(result.copyOfRange(0, expectedSize), null)
                 }
-                // Stall detected — fall through to retry
+                // Stall detected — save partial data and fall through to retry
+                lastPartialData = if (buffer.size() > 0) buffer.toByteArray() else lastPartialData
                 WebhookLog.error("BLE: stall at ${buffer.size()}/$expectedSize bytes")
             } catch (exception: TimeoutCancellationException) {
+                lastPartialData = if (buffer.size() > 0) buffer.toByteArray() else lastPartialData
                 Log.w(TAG, "Transfer timed out at ${buffer.size()} bytes.")
                 WebhookLog.error("BLE: timeout at ${buffer.size()} bytes")
             } catch (exception: IOException) {
+                lastPartialData = if (buffer.size() > 0) buffer.toByteArray() else lastPartialData
                 Log.w(TAG, "Pendant disconnected during transfer at ${buffer.size()} bytes.")
                 WebhookLog.error("BLE: disconnect at ${buffer.size()} bytes")
             } catch (exception: kotlinx.coroutines.CancellationException) {
                 throw exception
             } catch (exception: Exception) {
+                lastPartialData = if (buffer.size() > 0) buffer.toByteArray() else lastPartialData
                 Log.w(TAG, "Transfer failed at ${buffer.size()} bytes: $exception")
                 WebhookLog.error("BLE: error at ${buffer.size()} bytes: ${exception::class.simpleName}")
             } finally {
@@ -289,9 +304,27 @@ class PendantBleManager(context: Context) : BleManager(context) {
             }
         }
 
-        throw RuntimeException(
-            "Failed to transfer file after $MAX_FILE_TRANSFER_ATTEMPTS attempts."
-        )
+        // All retries exhausted. Return whatever partial data we received so
+        // the caller can save a broken recording rather than losing it entirely.
+        // The caller must send SKIP_FILE to delete the file from the pendant.
+        return TransferResult(null, lastPartialData)
+    }
+
+    /**
+     * Sends the SKIP_FILE command, telling the firmware to delete the current
+     * file without requiring a successful transfer. Used after all transfer
+     * retries are exhausted so the sync queue is not permanently stuck.
+     */
+    suspend fun skipCurrentFile() {
+        writeCommand(COMMAND_SKIP_FILE)
+    }
+
+    /**
+     * Tells the pendant to erase its stored pairing token, making it
+     * unclaimed. The pendant will disconnect after processing.
+     */
+    suspend fun unpairPendant() {
+        writeCommand(COMMAND_UNPAIR)
     }
 
     /**

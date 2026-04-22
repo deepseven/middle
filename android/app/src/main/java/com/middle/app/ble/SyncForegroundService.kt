@@ -1,9 +1,11 @@
 package com.middle.app.ble
 
+import android.app.PendingIntent
 import android.app.Service
 import android.bluetooth.BluetoothManager
 import android.content.ClipData
 import android.content.ClipboardManager
+import android.bluetooth.le.BluetoothLeScanner
 import android.bluetooth.le.ScanCallback
 import android.bluetooth.le.ScanFilter
 import android.bluetooth.le.ScanResult
@@ -17,6 +19,7 @@ import android.media.MediaRecorder
 import android.os.Build
 import android.os.IBinder
 import android.os.ParcelUuid
+import android.os.PowerManager
 import android.os.VibrationEffect
 import android.os.Vibrator
 import android.os.VibratorManager
@@ -52,15 +55,16 @@ import java.util.Locale
 
 class SyncForegroundService : Service() {
 
-    private data class ScanProfile(
-        val scanMode: Int,
-        val windowMillis: Long,
-        val periodMillis: Long,
-    )
-
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Main)
     private var syncJob: Job? = null
-    private var scanning = false
+
+    // Foreground callback-based scan state.
+    private var fgScanning = false
+
+    // Background PendingIntent-based scan state.
+    private var bgScanActive = false
+
+    private var wakeLock: PowerManager.WakeLock? = null
 
     private lateinit var repository: RecordingsRepository
     private lateinit var settings: Settings
@@ -78,6 +82,21 @@ class SyncForegroundService : Service() {
         when (intent?.action) {
             TaskerReceiver.ACTION_PTT_START -> startPttRecording()
             TaskerReceiver.ACTION_PTT_STOP -> scope.launch { stopPttRecording() }
+            ACTION_UNPAIR -> {
+                val address = intent.getStringExtra(EXTRA_DEVICE_ADDRESS) ?: ""
+                val token = intent.getStringExtra(EXTRA_PAIRING_TOKEN) ?: ""
+                if (address.isNotEmpty() && token.isNotEmpty()) {
+                    scope.launch { performUnpair(address, token) }
+                }
+            }
+            ACTION_BG_SCAN_RESULT -> {
+                // Delivered by the PendingIntent-based background scan.
+                val results = intent.getScanResults()
+                if (results.isNotEmpty() && syncJob?.isActive != true) {
+                    Log.d(TAG, "Background scan found pendant: ${results[0].device.address}")
+                    syncJob = scope.launch { syncWithDevice(results[0]) }
+                }
+            }
         }
         return START_STICKY
     }
@@ -85,7 +104,8 @@ class SyncForegroundService : Service() {
     override fun onBind(intent: Intent?): IBinder? = null
 
     override fun onDestroy() {
-        stopScan()
+        stopForegroundScan()
+        stopBackgroundScan()
         scope.cancel()
         super.onDestroy()
     }
@@ -105,61 +125,41 @@ class SyncForegroundService : Service() {
         startForegroundNotification(text)
     }
 
+    // ------------------------------------------------------------------
+    //  Scan loop: foreground = callback LOW_LATENCY,
+    //             background = PendingIntent LOW_POWER (hardware-offloaded)
+    // ------------------------------------------------------------------
+
     private fun startScanLoop() {
         scope.launch {
             updateNotification(getString(R.string.sync_notification_scanning))
             while (true) {
-                // Skip scan if a sync job is currently active.
                 if (syncJob?.isActive != true) {
-                    val profile = currentScanProfile()
-                    startScan(profile.scanMode)
-                    delay(profile.windowMillis)
-                    stopScan()
-                    delayUntilNextScan(profile)
+                    if (AppVisibility.isForeground.value) {
+                        // App is visible — use callback-based fast scan.
+                        stopBackgroundScan()
+                        startForegroundScan()
+                        delay(FOREGROUND_SCAN_WINDOW_MILLIS)
+                        stopForegroundScan()
+                        delay(FOREGROUND_SCAN_PERIOD_MILLIS - FOREGROUND_SCAN_WINDOW_MILLIS)
+                    } else {
+                        // App is in background — switch to PendingIntent scan.
+                        // This is hardware-offloaded: the BT controller matches
+                        // the filter autonomously and wakes us via PendingIntent,
+                        // even in Doze mode, with near-zero battery cost.
+                        stopForegroundScan()
+                        startBackgroundScan()
+                        delay(5_000)
+                    }
                 } else {
-                    // Sync is active, wait before checking again.
                     delay(500)
                 }
             }
         }
     }
 
-    private suspend fun delayUntilNextScan(profile: ScanProfile) {
-        var remaining = profile.periodMillis - profile.windowMillis
-        while (remaining > 0) {
-            if (currentScanProfile() != profile) {
-                return
-            }
-            val step = minOf(remaining, 250L)
-            delay(step)
-            remaining -= step
-        }
-    }
-
-    private fun currentScanProfile(): ScanProfile {
-        if (AppVisibility.isForeground.value) {
-            return ScanProfile(
-                scanMode = ScanSettings.SCAN_MODE_LOW_LATENCY,
-                windowMillis = FOREGROUND_SCAN_WINDOW_MILLIS,
-                periodMillis = FOREGROUND_SCAN_PERIOD_MILLIS,
-            )
-        }
-
-        return ScanProfile(
-            scanMode = ScanSettings.SCAN_MODE_LOW_LATENCY,
-            windowMillis = BACKGROUND_SCAN_WINDOW_MILLIS,
-            periodMillis = BACKGROUND_SCAN_PERIOD_MILLIS,
-        )
-    }
-
-    private fun startScan(scanMode: Int) {
-        val bluetoothManager = getSystemService(BluetoothManager::class.java)
-        val adapter = bluetoothManager?.adapter ?: return
-        val scanner = adapter.bluetoothLeScanner ?: return
-
-        // When paired, filter by MAC so we only wake up for our pendant.
-        // When not paired, filter by service UUID to discover any pendant.
-        val filter = if (settings.isPaired) {
+    private fun buildScanFilter(): ScanFilter {
+        return if (settings.isPaired) {
             ScanFilter.Builder()
                 .setDeviceAddress(settings.pairedDeviceAddress)
                 .build()
@@ -168,49 +168,121 @@ class SyncForegroundService : Service() {
                 .setServiceUuid(ParcelUuid(SERVICE_UUID))
                 .build()
         }
+    }
 
+    private fun getScanner(): BluetoothLeScanner? {
+        val bluetoothManager = getSystemService(BluetoothManager::class.java)
+        return bluetoothManager?.adapter?.bluetoothLeScanner
+    }
+
+    // --- Foreground callback-based scan (LOW_LATENCY) ---
+
+    private fun startForegroundScan() {
+        if (fgScanning) return
+        val scanner = getScanner() ?: return
         val scanSettings = ScanSettings.Builder()
-            .setScanMode(scanMode)
+            .setScanMode(ScanSettings.SCAN_MODE_LOW_LATENCY)
             .build()
-
         try {
-            scanner.startScan(listOf(filter), scanSettings, scanCallback)
-            scanning = true
-            Log.d(TAG, "BLE scan started.")
+            scanner.startScan(listOf(buildScanFilter()), scanSettings, fgScanCallback)
+            fgScanning = true
+            Log.d(TAG, "Foreground BLE scan started.")
         } catch (exception: SecurityException) {
             Log.e(TAG, "BLE scan permission denied: $exception")
         }
     }
 
-    private fun stopScan() {
-        if (!scanning) return
-        val bluetoothManager = getSystemService(BluetoothManager::class.java)
-        val scanner = bluetoothManager?.adapter?.bluetoothLeScanner ?: return
-        try {
-            scanner.stopScan(scanCallback)
-        } catch (exception: SecurityException) {
-            Log.e(TAG, "Failed to stop scan: $exception")
-        }
-        scanning = false
+    private fun stopForegroundScan() {
+        if (!fgScanning) return
+        val scanner = getScanner() ?: return
+        try { scanner.stopScan(fgScanCallback) } catch (_: SecurityException) {}
+        fgScanning = false
     }
 
-    private val scanCallback = object : ScanCallback() {
+    private val fgScanCallback = object : ScanCallback() {
         override fun onScanResult(callbackType: Int, result: ScanResult) {
-            // Avoid starting multiple sync jobs simultaneously.
             if (syncJob?.isActive == true) return
-
-            Log.d(TAG, "Found pendant: ${result.device.address}")
-            stopScan()
+            Log.d(TAG, "Foreground scan found pendant: ${result.device.address}")
+            stopForegroundScan()
             syncJob = scope.launch { syncWithDevice(result) }
         }
 
         override fun onScanFailed(errorCode: Int) {
-            Log.e(TAG, "BLE scan failed with error code: $errorCode")
-            // The scan loop will naturally retry on the next iteration.
+            Log.e(TAG, "Foreground BLE scan failed with error code: $errorCode")
         }
     }
 
+    // --- Background PendingIntent-based scan (LOW_POWER, hardware-offloaded) ---
+
+    private fun buildScanPendingIntent(): PendingIntent {
+        val intent = Intent(this, SyncForegroundService::class.java).apply {
+            action = ACTION_BG_SCAN_RESULT
+        }
+        return PendingIntent.getService(
+            this,
+            BG_SCAN_REQUEST_CODE,
+            intent,
+            PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_MUTABLE,
+        )
+    }
+
+    private fun startBackgroundScan() {
+        if (bgScanActive) return
+        val scanner = getScanner() ?: return
+        val scanSettings = ScanSettings.Builder()
+            .setScanMode(ScanSettings.SCAN_MODE_LOW_POWER)
+            .build()
+        try {
+            scanner.startScan(listOf(buildScanFilter()), scanSettings, buildScanPendingIntent())
+            bgScanActive = true
+            Log.d(TAG, "Background PendingIntent BLE scan started.")
+        } catch (exception: SecurityException) {
+            Log.e(TAG, "Background BLE scan permission denied: $exception")
+        }
+    }
+
+    private fun stopBackgroundScan() {
+        if (!bgScanActive) return
+        val scanner = getScanner() ?: return
+        try { scanner.stopScan(buildScanPendingIntent()) } catch (_: SecurityException) {}
+        bgScanActive = false
+    }
+
+    /** Extract ScanResults from a PendingIntent-delivered intent. */
+    @Suppress("DEPRECATION")
+    private fun Intent.getScanResults(): List<ScanResult> {
+        return if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+            getParcelableArrayListExtra(
+                BluetoothLeScanner.EXTRA_LIST_SCAN_RESULT,
+                ScanResult::class.java,
+            ) ?: emptyList()
+        } else {
+            getParcelableArrayListExtra(BluetoothLeScanner.EXTRA_LIST_SCAN_RESULT)
+                ?: emptyList()
+        }
+    }
+
+    // --- Wake lock for active sync ---
+
+    private fun acquireSyncWakeLock() {
+        if (wakeLock != null) return
+        val pm = getSystemService(POWER_SERVICE) as PowerManager
+        wakeLock = pm.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "Middle::BleSync").apply {
+            acquire(5 * 60 * 1000L) // 5-minute safety timeout
+        }
+        Log.d(TAG, "Sync wake lock acquired.")
+    }
+
+    private fun releaseSyncWakeLock() {
+        wakeLock?.let {
+            if (it.isHeld) it.release()
+            Log.d(TAG, "Sync wake lock released.")
+        }
+        wakeLock = null
+    }
+
     private suspend fun syncWithDevice(scanResult: ScanResult) {
+        acquireSyncWakeLock()
         (application as MiddleApplication).retryQueue.startRetryLoopIfNeeded()
         val manager = PendantBleManager(this)
         try {
@@ -272,17 +344,40 @@ class SyncForegroundService : Service() {
                     Log.d(TAG, "Requesting file ${i + 1}/$fileCount...")
                     updateNotification("Syncing file ${i + 1}/$fileCount...")
 
-                    val imaData = manager.requestNextFile()
+                    val transfer = manager.requestNextFile()
 
                     // Empty files are corrupt or aborted recordings. ACK to delete
                     // them from the pendant and continue to the next file.
-                    if (imaData == null) {
+                    if (transfer.data == null && transfer.partialData == null) {
                         Log.d(TAG, "Skipping empty file ${i + 1}/$fileCount.")
                         manager.acknowledgeFile()
                         delay(300)
                         continue
                     }
 
+                    // Transfer failed but we have partial data — save what we
+                    // got and skip the file on the pendant so the sync queue
+                    // is not permanently stuck.
+                    if (transfer.data == null) {
+                        val partial = transfer.partialData!!
+                        val ts = SimpleDateFormat("yyyyMMdd_HHmmss", Locale.US).format(Date())
+                        val baseName = "recording_${ts}_${i}_partial"
+                        try {
+                            val audioFile = repository.saveEncodedRecording(partial, "${baseName}.m4a")
+                            Log.w(TAG, "Saved partial recording ${audioFile.name} (${partial.size} IMA bytes).")
+                            WebhookLog.info("BLE: saved partial ${audioFile.name}")
+                        } catch (e: Exception) {
+                            Log.w(TAG, "Could not decode partial IMA data, saving raw: $e")
+                            val rawFile = java.io.File(repository.directory, "${baseName}.ima")
+                            rawFile.writeBytes(partial)
+                            WebhookLog.error("BLE: saved raw partial ${rawFile.name} (${partial.size} bytes)")
+                        }
+                        manager.skipCurrentFile()
+                        delay(300)
+                        continue
+                    }
+
+                    val imaData = transfer.data
                     Log.d(TAG, "Received ${imaData.size} bytes.")
 
                     val timestamp = SimpleDateFormat("yyyyMMdd_HHmmss", Locale.US).format(Date())
@@ -382,6 +477,7 @@ class SyncForegroundService : Service() {
             } catch (exception: Exception) {
                 Log.w(TAG, "Disconnect error: $exception")
             }
+            releaseSyncWakeLock()
             updateNotification(getString(R.string.sync_notification_scanning))
         }
     }
@@ -587,6 +683,26 @@ class SyncForegroundService : Service() {
         return bytes
     }
 
+    private suspend fun performUnpair(address: String, tokenHex: String) {
+        val manager = PendantBleManager(this)
+        try {
+            val bluetoothManager = getSystemService(BluetoothManager::class.java)
+            val device = bluetoothManager?.adapter?.getRemoteDevice(address)
+            if (device == null) {
+                Log.w(TAG, "[unpair] Could not get BluetoothDevice for $address")
+                return
+            }
+            manager.connectTo(device)
+            manager.writePairingToken(hexToBytes(tokenHex))
+            manager.unpairPendant()
+            Log.d(TAG, "[unpair] UNPAIR command sent, pendant token erased")
+        } catch (e: Exception) {
+            Log.w(TAG, "[unpair] Failed to send UNPAIR to pendant: $e")
+        } finally {
+            try { manager.disconnect().enqueue() } catch (_: Exception) {}
+        }
+    }
+
     private fun bytesToHex(bytes: ByteArray): String =
         bytes.joinToString("") { "%02x".format(it) }
 
@@ -625,6 +741,11 @@ class SyncForegroundService : Service() {
 
     companion object {
         private const val TAG = "SyncService"
+        const val ACTION_UNPAIR = "com.middle.app.ACTION_UNPAIR"
+        const val ACTION_BG_SCAN_RESULT = "com.middle.app.ACTION_BG_SCAN_RESULT"
+        const val EXTRA_DEVICE_ADDRESS = "device_address"
+        const val EXTRA_PAIRING_TOKEN = "pairing_token"
+        private const val BG_SCAN_REQUEST_CODE = 1001
 
         private val _syncState = MutableStateFlow("Idle")
         val syncState: StateFlow<String> = _syncState

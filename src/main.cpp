@@ -12,7 +12,7 @@
 #include <driver/i2s_pdm.h>
 #include <TFT_eSPI.h>
 #elif defined(BOARD_M5STICKS3)
-#include <driver/i2s_pdm.h>
+#include <driver/i2s_std.h>
 #include <M5Unified.h>
 #else
 #include <driver/i2s_std.h>
@@ -35,7 +35,7 @@
 #include <nvs.h>
 #include <nvs_flash.h>
 
-#define DEBUG 0
+#define DEBUG 1
 
 #if DEBUG
   #define DBG(...) Serial.printf(__VA_ARGS__)
@@ -63,9 +63,7 @@ static const int pin_pdm_data = 34;
 // M5StickS3 pin mapping. Buttons are read via M5Unified (BtnA=35, BtnB=37)
 // but we still need pin_button for ext0 deep sleep wakeup.
 static const int pin_button = 35;       // BtnA (front button), for wakeup
-// SPM1423 PDM microphone pins (built into device).
-static const int pin_pdm_clk = 0;
-static const int pin_pdm_data = 1;      // Different from Plus2's GPIO 34
+// Mic I2S pins are managed by M5Unified (internal_mic=true).
 #else
 static const int pin_button = 2;
 static const int pin_battery = 1;
@@ -130,8 +128,10 @@ static const int pdm_gain_shift = 3;
 // 8x gain (shift 3).
 static const int pdm_gain_shift = 3;
 #elif defined(BOARD_M5STICKS3)
-// Software gain for the M5StickS3's SPM1423 PDM mic.
-static const int pdm_gain_shift = 3;
+// Software gain for the M5StickS3 mic (via ES8311 codec).
+// The codec's ADC gain is set to max (reg 0x17=0xFF), so less
+// software gain may be needed. Start with 2 (4x).
+static const int pdm_gain_shift = 2;
 #endif
 
 // IMA ADPCM step size table — indexed by step_index (0..88).
@@ -608,7 +608,33 @@ static bool m5_display_ready = false;
 static void m5_display_init() {
   auto cfg = M5.config();
   cfg.fallback_board = m5::board_t::board_M5StickS3;
+  cfg.internal_mic = true;   // Let M5Unified handle ES8311 codec + I2S (HAL clock magic)
+  cfg.internal_spk = false;  // Don't init speaker — it interferes with mic codec config
   M5.begin(cfg);
+  // Power on the ES8311 codec via the PY32 PMIC.  M5Unified's mic callback
+  // does NOT touch PMIC (only the speaker callback does), so we must set
+  // bit 3 of register 0x11 ourselves.
+  // IMPORTANT: M5.begin() with internal_mic=true already called the mic
+  // callback which wrote ES8311 registers — but the codec was unpowered at
+  // that point, so those writes were lost.  We must power the PMIC first,
+  // then restart the mic so the callback re-writes the codec registers to
+  // a now-powered ES8311.
+  M5.In_I2C.bitOn(0x6E, 0x11, 0b00001000, 100000);
+  delay(50);  // let ES8311 power domain stabilize
+  // ES8311 codec is shared between mic and speaker — the official tutorial
+  // requires Speaker.end() before Mic.begin() to avoid codec conflicts.
+  M5.Speaker.end();
+  M5.Mic.end();
+  // Reduce M5Unified mic gain: default magnification=16 with over_sampling=2
+  // gives 4x internal gain.  The ES8311 ADC is already at +32dB (reg 0x17=0xFF).
+  // Set magnification=1 so M5Unified applies ~0.25x, and let our
+  // pdm_gain_shift handle the rest.
+  {
+    auto mic_cfg = M5.Mic.config();
+    mic_cfg.magnification = 1;
+    M5.Mic.config(mic_cfg);
+  }
+  M5.Mic.begin();
   M5.Display.setRotation(1);  // Landscape: 240x135
   M5.Display.fillScreen(TFT_BLACK);
   M5.Display.setTextSize(2);
@@ -788,8 +814,9 @@ static void configure_button_wakeup() {
   esp_sleep_enable_ext0_wakeup((gpio_num_t)pin_button, 0);
   esp_sleep_enable_ext1_wakeup(1ULL << pin_button_pwr, ESP_EXT1_WAKEUP_ALL_LOW);
 #elif defined(BOARD_M5STICKS3)
-  // M5StickS3: BtnA (GPIO 35) for ext0 wakeup.
-  esp_sleep_enable_ext0_wakeup((gpio_num_t)pin_button, 0);
+  // M5StickS3: no wakeup needed — device stays awake, user powers off
+  // via hardware power button.  configure_button_wakeup() is still called
+  // at boot but this board is a no-op.
 #else
   esp_sleep_enable_ext0_wakeup((gpio_num_t)pin_button, 0);
 #ifndef BOARD_XIAO_SENSE
@@ -822,9 +849,10 @@ static void enter_deep_sleep() {
   gpio_hold_en((gpio_num_t)pin_pdm_clk);
   gpio_deep_sleep_hold_en();
 #elif defined(BOARD_M5STICKS3)
-  // M5StickS3: PY32 PMIC handles power management. Hold PDM clock LOW.
-  gpio_hold_en((gpio_num_t)pin_pdm_clk);
-  gpio_deep_sleep_hold_en();
+  // M5StickS3: never enters software-managed sleep.  The user powers off
+  // via the hardware power button (hold > 6s).  This function should not
+  // be reached for this board.
+  return;
 #elif !defined(BOARD_XIAO_SENSE)
   // Hold the mic power pin LOW during deep sleep so the INMP441's internal
   // pull-up cannot draw current while the chip is sleeping.
@@ -998,7 +1026,46 @@ static const size_t i2s_read_frames = 512;
 
 static i2s_chan_handle_t i2s_rx_channel = nullptr;
 
-#if defined(BOARD_XIAO_SENSE) || defined(BOARD_M5STICKCPLUS2) || defined(BOARD_M5STICKS3)
+#if defined(BOARD_M5STICKS3)
+// M5StickS3: mic is managed by M5Unified (internal_mic=true).
+// Mic stays alive from m5_display_init() — M5.Mic.begin() after end()
+// fails to reinit the ES8311 codec.  i2s_init just flushes stale DMA data.
+static bool i2s_init() {
+  // M5.Mic.record() is async: it submits a request to the mic task and
+  // returns immediately while DMA fills the buffer in the background.
+  // The warmup buffer MUST be static — a stack buffer would be freed
+  // before the mic task finishes writing, corrupting the stack.
+  static int16_t warmup[256];
+  if (!M5.Mic.isEnabled()) {
+    DBG("[rec] mic not enabled, attempting begin()\r\n");
+    M5.In_I2C.bitOn(0x6E, 0x11, 0b00001000, 100000);
+    delay(50);
+    M5.Speaker.end();
+    auto mic_cfg = M5.Mic.config();
+    mic_cfg.magnification = 1;
+    M5.Mic.config(mic_cfg);
+    if (!M5.Mic.begin()) {
+      DBG("[rec] M5.Mic.begin() failed\r\n");
+      return false;
+    }
+    M5.Mic.record(warmup, 256, sample_rate, false);
+    delay(500);
+    for (int i = 0; i < 4; i++) {
+      M5.Mic.record(warmup, 256, sample_rate, false);
+    }
+  } else {
+    // Mic already running — just flush stale DMA data.
+    for (int i = 0; i < 4; i++) {
+      M5.Mic.record(warmup, 256, sample_rate, false);
+    }
+  }
+  // Wait for the last async record() to complete before returning,
+  // otherwise the mic task continues writing to warmup in the background.
+  while (M5.Mic.isRecording()) { delay(1); }
+  DBG("[rec] M5Unified mic ready\r\n");
+  return true;
+}
+#elif defined(BOARD_XIAO_SENSE) || defined(BOARD_M5STICKCPLUS2)
 static bool i2s_init() {
   i2s_chan_config_t channel_config = I2S_CHANNEL_DEFAULT_CONFIG(
       I2S_NUM_AUTO, I2S_ROLE_MASTER);
@@ -1080,11 +1147,17 @@ static bool i2s_init() {
 #endif
 
 static void i2s_deinit() {
+#if defined(BOARD_M5STICKS3)
+  // Keep mic alive — M5.Mic.begin() after end() fails to reinit the
+  // ES8311 codec, producing all-zero samples on subsequent recordings.
+  DBG("[rec] mic kept alive (M5Unified)\r\n");
+#else
   if (i2s_rx_channel != nullptr) {
     i2s_channel_disable(i2s_rx_channel);
     i2s_del_channel(i2s_rx_channel);
     i2s_rx_channel = nullptr;
   }
+#endif
 }
 
 static bool record_and_save() {
@@ -1142,7 +1215,7 @@ static bool record_and_save() {
     }
 
 #if defined(BOARD_XIAO_SENSE) || defined(BOARD_M5STICKCPLUS2) || defined(BOARD_M5STICKS3)
-    // PDM mode produces 16-bit mono samples directly.
+    // PDM / ES8311 codec modes produce 16-bit mono samples directly.
     static int16_t i2s_buf[i2s_read_frames];
 #else
     // In stereo mode each frame has two 32-bit slots (left + right).
@@ -1156,18 +1229,45 @@ static bool record_and_save() {
     // transient.
     size_t discarded = 0;
     while (discarded < i2s_startup_discard_samples) {
+#if defined(BOARD_M5STICKS3)
+      if (!M5.Mic.record(i2s_buf, i2s_read_frames, sample_rate, false)) break;
+      bytes_read = i2s_read_frames * sizeof(int16_t);
+#else
       esp_err_t err = i2s_channel_read(i2s_rx_channel, i2s_buf, sizeof(i2s_buf),
                                        &bytes_read, portMAX_DELAY);
       if (err != ESP_OK) {
         DBG("[rec] i2s_channel_read error %d in discard loop\r\n", err);
         break;
       }
+#endif
 #if defined(BOARD_XIAO_SENSE) || defined(BOARD_M5STICKCPLUS2) || defined(BOARD_M5STICKS3)
       discarded += bytes_read / sizeof(int16_t);
 #else
       discarded += bytes_read / sizeof(int32_t) / 2;
 #endif
     }
+
+    // Debug: log first few samples after discard to diagnose silence.
+#if DEBUG && (defined(BOARD_XIAO_SENSE) || defined(BOARD_M5STICKCPLUS2) || defined(BOARD_M5STICKS3))
+    {
+#if defined(BOARD_M5STICKS3)
+      M5.Mic.record(i2s_buf, i2s_read_frames, sample_rate, false);
+      bytes_read = i2s_read_frames * sizeof(int16_t);
+#else
+      esp_err_t err = i2s_channel_read(i2s_rx_channel, i2s_buf, sizeof(i2s_buf),
+                                       &bytes_read, portMAX_DELAY);
+#endif
+      size_t n = bytes_read / sizeof(int16_t);
+      int16_t mn = 0, mx = 0;
+      for (size_t i = 0; i < n; i++) {
+        if (i2s_buf[i] < mn) mn = i2s_buf[i];
+        if (i2s_buf[i] > mx) mx = i2s_buf[i];
+      }
+      DBG("[rec] first %u samples: min=%d max=%d [0]=%d [1]=%d [2]=%d [3]=%d\r\n",
+          (unsigned)n, mn, mx, n>0?i2s_buf[0]:0, n>1?i2s_buf[1]:0,
+          n>2?i2s_buf[2]:0, n>3?i2s_buf[3]:0);
+    }
+#endif
 
     unsigned long record_start_milliseconds = millis();
     uint32_t sample_count = 0;
@@ -1176,7 +1276,21 @@ static bool record_and_save() {
     bool nibble_pending = false;
     uint8_t packed_byte = 0;
 
+#if defined(BOARD_M5STICKS3)
+    // M5Unified manages the button GPIO; raw digitalRead is unreliable.
+    // Poll via M5.BtnA.isPressed() instead, refreshing state each iteration.
+    M5.update();
+    while (M5.BtnA.isPressed() && !writer_error) {
+#else
     while (digitalRead(pin_button) == LOW && !writer_error) {
+#endif
+#if defined(BOARD_M5STICKS3)
+      if (!M5.Mic.record(i2s_buf, i2s_read_frames, sample_rate, false)) {
+        DBG("[rec] M5.Mic.record() failed\r\n");
+        break;
+      }
+      bytes_read = i2s_read_frames * sizeof(int16_t);
+#else
       esp_err_t err = i2s_channel_read(i2s_rx_channel, i2s_buf,
                                        sizeof(i2s_buf), &bytes_read,
                                        portMAX_DELAY);
@@ -1184,6 +1298,7 @@ static bool record_and_save() {
         DBG("[rec] i2s_channel_read error %d\r\n", err);
         break;
       }
+#endif
 
 #if defined(BOARD_XIAO_SENSE) || defined(BOARD_M5STICKCPLUS2) || defined(BOARD_M5STICKS3)
       size_t total_samples = bytes_read / sizeof(int16_t);
@@ -1211,6 +1326,9 @@ static bool record_and_save() {
           nibble_pending = false;
         }
       }
+#if defined(BOARD_M5STICKS3)
+      M5.update();
+#endif
     }
 
     // Flush the trailing nibble if the sample count was odd.
@@ -1627,9 +1745,14 @@ void setup() {
 
 #if DEBUG
   Serial.begin(115200);
+  delay(1500);  // Give USB-Serial/JTAG time to stabilize
+  Serial.printf("\r\n\r\n[setup] === BOOT START ===\r\n");
 #endif
 
+  // M5StickS3 buttons are managed by M5Unified — skip raw GPIO setup.
+#if !defined(BOARD_M5STICKS3)
   pinMode(pin_button, INPUT_PULLUP);
+#endif
 #ifdef BOARD_XIAO_SENSE
   oled_init();
 #elif defined(BOARD_M5STICKCPLUS2)
@@ -1644,10 +1767,8 @@ void setup() {
   pinMode(pin_button_pwr, INPUT);
   tft_init();
 #elif defined(BOARD_M5STICKS3)
-  // Release deep sleep hold before reconfiguring held pins.
-  gpio_hold_dis((gpio_num_t)pin_pdm_clk);
-  gpio_deep_sleep_hold_dis();
   m5_display_init();
+  Serial.printf("[setup] m5_display_init done, display_is_on=%d, m5_display_ready=%d\r\n", display_is_on, m5_display_ready);
 #else
   // Release the GPIO hold set in enter_deep_sleep() before reconfiguring the
   // pin. If the hold is still active, pinMode() fights the latched state.
@@ -1662,12 +1783,103 @@ void setup() {
   nvs_flash_init();
 
   configure_button_wakeup();
+
+#if defined(BOARD_M5STICKS3)
+  // M5StickS3 stays awake after boot — no software sleep.  The user
+  // controls power via the hardware power button.
+  Serial.printf("[setup] M5StickS3 always-on boot\r\n");
+
+#if DEBUG
+  // === Boot-time mic diagnostic using M5Unified ===
+  Serial.printf("[diag] --- M5Unified mic diagnostic start ---\r\n");
+
+  // Power on the ES8311 via PMIC (M5Unified mic callback doesn't do this).
+  {
+    uint8_t before = 0;
+    M5.In_I2C.readRegister(0x6E, 0x11, &before, 1, 100000);
+    Serial.printf("[diag] PMIC 0x11 before: 0x%02X\r\n", before);
+    M5.In_I2C.bitOn(0x6E, 0x11, 0b00001000, 100000);
+    delay(50);
+    uint8_t after = 0;
+    M5.In_I2C.readRegister(0x6E, 0x11, &after, 1, 100000);
+    Serial.printf("[diag] PMIC 0x11 after:  0x%02X\r\n", after);
+  }
+
+  // Test M5Unified's own mic system (it handles ES8311 + I2S + HAL clocks).
+  // Buffer MUST be static: M5.Mic.record() is async — the mic task writes
+  // to the buffer in the background after record() returns.
+  {
+    static int16_t test_buf[512];
+    memset(test_buf, 0, sizeof(test_buf));
+    Serial.printf("[diag] Calling M5.Mic.record(512, %d)...\r\n", sample_rate);
+    bool ok = M5.Mic.record(test_buf, 512, sample_rate, false);
+    while (M5.Mic.isRecording()) { delay(1); }
+    Serial.printf("[diag] M5.Mic.record() = %s\r\n", ok ? "OK" : "FAIL");
+
+    int16_t mn = 0, mx = 0;
+    int32_t sum = 0;
+    int non_zero = 0;
+    for (int i = 0; i < 512; i++) {
+      if (test_buf[i] < mn) mn = test_buf[i];
+      if (test_buf[i] > mx) mx = test_buf[i];
+      sum += test_buf[i];
+      if (test_buf[i] != 0) non_zero++;
+    }
+    Serial.printf("[diag] 512 samples: min=%d max=%d avg=%d non_zero=%d\r\n",
+                  mn, mx, (int)(sum / 512), non_zero);
+    Serial.printf("[diag] first 8: %d %d %d %d %d %d %d %d\r\n",
+                  test_buf[0], test_buf[1], test_buf[2], test_buf[3],
+                  test_buf[4], test_buf[5], test_buf[6], test_buf[7]);
+
+    // Second read to skip startup transient
+    memset(test_buf, 0, sizeof(test_buf));
+    M5.Mic.record(test_buf, 512, sample_rate, false);
+    while (M5.Mic.isRecording()) { delay(1); }
+    mn = 0; mx = 0; sum = 0; non_zero = 0;
+    for (int i = 0; i < 512; i++) {
+      if (test_buf[i] < mn) mn = test_buf[i];
+      if (test_buf[i] > mx) mx = test_buf[i];
+      sum += test_buf[i];
+      if (test_buf[i] != 0) non_zero++;
+    }
+    Serial.printf("[diag] 2nd read: min=%d max=%d avg=%d non_zero=%d\r\n",
+                  mn, mx, (int)(sum / 512), non_zero);
+    Serial.printf("[diag] first 8: %d %d %d %d %d %d %d %d\r\n",
+                  test_buf[0], test_buf[1], test_buf[2], test_buf[3],
+                  test_buf[4], test_buf[5], test_buf[6], test_buf[7]);
+
+    // Third read after more delay
+    delay(500);
+    memset(test_buf, 0, sizeof(test_buf));
+    M5.Mic.record(test_buf, 512, sample_rate, false);
+    while (M5.Mic.isRecording()) { delay(1); }
+    mn = 0; mx = 0; sum = 0; non_zero = 0;
+    for (int i = 0; i < 512; i++) {
+      if (test_buf[i] < mn) mn = test_buf[i];
+      if (test_buf[i] > mx) mx = test_buf[i];
+      sum += test_buf[i];
+      if (test_buf[i] != 0) non_zero++;
+    }
+    Serial.printf("[diag] 3rd read (after 500ms): min=%d max=%d avg=%d non_zero=%d\r\n",
+                  mn, mx, (int)(sum / 512), non_zero);
+  }
+
+  Serial.printf("[diag] --- M5Unified mic diagnostic end ---\r\n");
+#endif
+
+  show_status_screen();
+  ble_active_until_milliseconds = millis() + display_timeout_ms;
+#else
   esp_sleep_wakeup_cause_t wakeup_cause = esp_sleep_get_wakeup_cause();
+  Serial.printf("[setup] wakeup_cause=%d (EXT0=%d, EXT1=%d)\r\n", wakeup_cause, ESP_SLEEP_WAKEUP_EXT0, ESP_SLEEP_WAKEUP_EXT1);
 
   if (wakeup_cause != ESP_SLEEP_WAKEUP_EXT0 &&
       wakeup_cause != ESP_SLEEP_WAKEUP_EXT1) {
+    Serial.printf("[setup] not EXT0/EXT1, entering deep sleep\r\n");
     enter_deep_sleep();
   }
+
+  Serial.printf("[setup] passed wakeup check, proceeding\r\n");
 
 #ifdef BOARD_M5STICKCPLUS2
   // Power button wakeup: show status and keep awake long enough for
@@ -1677,13 +1889,29 @@ void setup() {
     ble_active_until_milliseconds = millis() + display_timeout_ms;
   }
 #endif
+#endif  // BOARD_M5STICKS3
 
   remove_empty_recordings();
 
+#if defined(BOARD_M5STICKS3)
+  // M5Unified manages BtnA on GPIO 35 — use its API, not raw digitalRead.
+  M5.update();
+  if (M5.BtnA.isPressed()) {
+    record_and_save();
+  }
+#else
   int button = digitalRead(pin_button);
   if (button == LOW) {
     record_and_save();
   }
+#endif
+
+#if defined(BOARD_M5STICKS3)
+  // Refresh the status screen and BLE window after any recording attempt
+  // so the user sees the result before the device sleeps again.
+  show_status_screen();
+  ble_active_until_milliseconds = millis() + display_timeout_ms;
+#endif
 }
 
 void loop() {
@@ -1698,6 +1926,8 @@ void loop() {
     start_ble_if_needed();
   }
 
+#if !defined(BOARD_M5STICKS3)
+  // M5StickS3 uses M5Unified BtnA API below instead of raw digitalRead.
   int button_state = digitalRead(pin_button);
   if (button_state != last_button_state) {
     last_button_state = button_state;
@@ -1706,6 +1936,9 @@ void loop() {
       start_ble_if_needed();
     }
   }
+#else
+  int button_state = HIGH;  // placeholder for sleep logic below
+#endif
 
   uint8_t command;
   while ((command = command_queue_pop()) != 0) {
@@ -1814,6 +2047,7 @@ void loop() {
     }
   }
 
+#if !defined(BOARD_M5STICKS3)
   if (button_state == HIGH && hard_sleep_deadline_milliseconds != 0 &&
       !client_connected &&
       (long)(millis() - hard_sleep_deadline_milliseconds) >= 0) {
@@ -1826,6 +2060,10 @@ void loop() {
     sleep_requested = false;
     enter_deep_sleep();
   }
+#else
+  // M5StickS3: no software sleep.  Just clear the flag if set.
+  sleep_requested = false;
+#endif
 
 #ifdef BOARD_M5STICKCPLUS2
   // BtnB: short press = force BLE advertising, long press (>=1s) = oblique strategy.
@@ -1885,32 +2123,39 @@ void loop() {
 #endif
 
 #ifdef BOARD_M5STICKS3
-  // M5StickS3: use M5Unified button API for BtnB.
-  // BtnB: short press = force BLE advertising, long press (>=1s) = oblique strategy.
+  // M5StickS3: use M5Unified button API for both BtnA and BtnB.
   M5.update();
-  if (M5.BtnB.wasPressed()) {
-    // Will check for long press below.
+
+  // BtnA (front): press = record.
+  if (M5.BtnA.wasPressed()) {
+    record_and_save();
+    start_ble_if_needed();
+    show_status_screen();
+    ble_active_until_milliseconds = millis() + display_timeout_ms;
   }
-  if (M5.BtnB.pressedFor(1000)) {
-    static bool btnb_long_handled = false;
-    if (!btnb_long_handled) {
-      btnb_long_handled = true;
-      show_oblique_strategy();
+
+  // BtnB (side): short press = force BLE advertising, long press (>=1s) = oblique strategy.
+  static bool m5s3_btnb_long_handled = false;
+  if (M5.BtnB.wasPressed()) {
+    m5s3_btnb_long_handled = false;
+  }
+  if (M5.BtnB.pressedFor(1000) && !m5s3_btnb_long_handled) {
+    m5s3_btnb_long_handled = true;
+    show_oblique_strategy();
+  }
+  if (M5.BtnB.wasReleased()) {
+    if (!m5s3_btnb_long_handled) {
+      // Short press — force sync.
+      if (!ble_initialized) {
+        init_ble();
+        ble_initialized = true;
+      }
+      uint16_t millivolts = read_battery_millivolts();
+      voltage_characteristic->setValue(millivolts);
+      update_file_count();
+      sync_total_files = pending_recording_count;
+      start_ble_advertising();
     }
-    if (M5.BtnB.wasReleased()) {
-      btnb_long_handled = false;
-    }
-  } else if (M5.BtnB.wasReleased()) {
-    // Short press — force sync.
-    if (!ble_initialized) {
-      init_ble();
-      ble_initialized = true;
-    }
-    uint16_t millivolts = read_battery_millivolts();
-    voltage_characteristic->setValue(millivolts);
-    update_file_count();
-    sync_total_files = pending_recording_count;
-    start_ble_advertising();
   }
 #endif
 

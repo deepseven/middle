@@ -1,7 +1,10 @@
 package com.middle.app.viewmodel
 
 import android.app.Application
+import android.content.Intent
+import androidx.core.content.ContextCompat
 import androidx.lifecycle.AndroidViewModel
+import com.middle.app.ble.SyncForegroundService
 import com.middle.app.data.Settings
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
@@ -97,6 +100,16 @@ class SettingsViewModel(application: Application) : AndroidViewModel(application
     }
 
     fun unpairPendant() {
+        val address = settings.pairedDeviceAddress
+        val token = settings.pairingToken
+        if (address.isNotEmpty() && token.isNotEmpty()) {
+            val intent = Intent(getApplication(), SyncForegroundService::class.java).apply {
+                action = SyncForegroundService.ACTION_UNPAIR
+                putExtra(SyncForegroundService.EXTRA_DEVICE_ADDRESS, address)
+                putExtra(SyncForegroundService.EXTRA_PAIRING_TOKEN, token)
+            }
+            ContextCompat.startForegroundService(getApplication(), intent)
+        }
         settings.clearPairing()
         _isPaired.value = false
         _pairingToken.value = ""

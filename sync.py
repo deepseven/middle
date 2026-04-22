@@ -23,6 +23,7 @@ import secrets
 import struct
 import subprocess
 import time
+import wave
 from datetime import datetime
 from pathlib import Path
 
@@ -57,6 +58,7 @@ TRANSCRIPTION_MODEL = "gpt-4o-transcribe"
 OPENAI_API_KEY_ENV_NAME = "OPENAI_API_KEY"
 
 RECORDINGS_DIRECTORY = Path(__file__).parent / "recordings"
+TOKEN_FILE = RECORDINGS_DIRECTORY / ".token"
 
 # How often to scan for the pendant.
 SCAN_INTERVAL_SECONDS = 5
@@ -67,6 +69,23 @@ TRANSFER_TOTAL_TIMEOUT_SECONDS = 120.0
 def log(message: str) -> None:
     timestamp = datetime.now().strftime("%H:%M:%S.%f")[:-3]
     print(f"[{timestamp}] {message}")
+
+
+def save_token(token_hex: str) -> None:
+    """Save the pairing token for reuse across sessions."""
+    RECORDINGS_DIRECTORY.mkdir(parents=True, exist_ok=True)
+    TOKEN_FILE.write_text(token_hex)
+
+
+def load_token() -> str | None:
+    """Load a previously saved pairing token."""
+    if TOKEN_FILE.exists():
+        token_hex = TOKEN_FILE.read_text().strip()
+        if len(token_hex) == 32 and all(
+            c in "0123456789abcdefABCDEF" for c in token_hex
+        ):
+            return token_hex
+    return None
 
 
 ADPCM_STEP_TABLE = [
@@ -130,19 +149,36 @@ def decode_ima_adpcm(data: bytes, sample_count: int) -> bytes:
     return bytes(output[:write_position])
 
 
-def encode_mp3_from_ima(ima_data: bytes) -> bytes:
-    """Decode an IMA ADPCM file (with 4-byte sample count header) to MP3."""
+def decode_ima_to_pcm16(ima_data: bytes) -> bytes:
+    """Decode an IMA ADPCM file (with 4-byte header) to raw PCM16LE."""
     sample_count = struct.unpack("<I", ima_data[:IMA_HEADER_SIZE])[0]
     adpcm_payload = ima_data[IMA_HEADER_SIZE:]
-    pcm16 = decode_ima_adpcm(adpcm_payload, sample_count)
+    return decode_ima_adpcm(adpcm_payload, sample_count)
 
+
+def encode_mp3_from_pcm16(pcm16: bytes) -> bytes:
+    """Encode raw PCM16LE bytes to MP3."""
     encoder = lameenc.Encoder()
     encoder.set_bit_rate(MP3_BIT_RATE_KILOBITS_PER_SECOND)
     encoder.set_in_sample_rate(SAMPLE_RATE)
     encoder.set_channels(NUMBER_OF_CHANNELS)
     encoder.set_quality(2)
-
     return encoder.encode(pcm16) + encoder.flush()
+
+
+def encode_mp3_from_ima(ima_data: bytes) -> bytes:
+    """Decode an IMA ADPCM file (with 4-byte sample count header) to MP3."""
+    pcm16 = decode_ima_to_pcm16(ima_data)
+    return encode_mp3_from_pcm16(pcm16)
+
+
+def write_wav(path: Path, pcm16: bytes) -> None:
+    """Write raw PCM16LE mono data as a standard WAV file."""
+    with wave.open(str(path), "wb") as wf:
+        wf.setnchannels(NUMBER_OF_CHANNELS)
+        wf.setsampwidth(2)
+        wf.setframerate(SAMPLE_RATE)
+        wf.writeframes(pcm16)
 
 
 def create_openai_client() -> OpenAI | None:
@@ -179,11 +215,11 @@ def transcribe_mp3_file(openai_client: OpenAI, filepath: Path) -> Path:
 async def perform_pairing_handshake(
     client: BleakClient,
     token_hex: str | None,
-) -> bool:
+) -> tuple[bool, str | None]:
     """Perform the pairing handshake before any file operations.
 
-    Returns True if pairing succeeded, False if it failed (e.g. pendant is
-    claimed but no token was provided).
+    Returns (True, token_hex) if pairing succeeded, (False, None) if it
+    failed (e.g. pendant is claimed but no token was provided).
     """
     raw_status = await client.read_gatt_char(CHARACTERISTIC_PAIRING_UUID)
     status = raw_status[0]
@@ -195,25 +231,27 @@ async def perform_pairing_handshake(
         else:
             token = secrets.token_bytes(16)
         await client.write_gatt_char(CHARACTERISTIC_PAIRING_UUID, token)
-        log(f"Pendant claimed with token: {token.hex()}")
+        token_hex = token.hex()
+        log(f"Pendant claimed with token: {token_hex}")
     elif status == 0x01:
         # Pendant is already claimed: authenticate with the provided token.
         if token_hex is None:
             log("Pendant is claimed. Provide --token <hex> to authenticate.")
-            return False
+            return False, None
         token = bytes.fromhex(token_hex)
         await client.write_gatt_char(CHARACTERISTIC_PAIRING_UUID, token)
         log("Token verified.")
     else:
         log(f"Unexpected pairing status byte: {status:#04x}")
-        return False
+        return False, None
 
-    return True
+    return True, token_hex
 
 
 async def sync_recordings(
     client: BleakClient,
     openai_client: OpenAI | None,
+    debug: bool = False,
 ) -> tuple[int, list[Path]]:
     """Download all pending recordings from the pendant. Returns the number
     of files synced."""
@@ -407,15 +445,23 @@ async def sync_recordings(
         )
 
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        filename = f"recording_{timestamp}_{i}.mp3"
-        filepath = RECORDINGS_DIRECTORY / filename
+        base_name = f"recording_{timestamp}_{i}"
+        filepath = RECORDINGS_DIRECTORY / f"{base_name}.mp3"
 
-        mp3_data = encode_mp3_from_ima(audio_data)
+        pcm16 = decode_ima_to_pcm16(audio_data)
+        mp3_data = encode_mp3_from_pcm16(pcm16)
         filepath.write_bytes(mp3_data)
         log(
             f"Saved {filepath} (MP3 {len(mp3_data)} bytes from "
             f"IMA ADPCM {len(audio_data)} bytes)."
         )
+
+        if debug:
+            ima_path = RECORDINGS_DIRECTORY / f"{base_name}.ima"
+            ima_path.write_bytes(audio_data)
+            wav_path = RECORDINGS_DIRECTORY / f"{base_name}.wav"
+            write_wav(wav_path, pcm16)
+            log(f"Debug: saved {ima_path} and {wav_path}.")
         saved_recordings.append(filepath)
 
         log("Sending ACK_RECEIVED command.")
@@ -456,8 +502,15 @@ async def sync_recordings(
 async def main(
     token_hex: str | None = None,
     bootloader: bool = False,
+    debug: bool = False,
 ) -> None:
     log("Middle BLE sync client started.")
+
+    if token_hex is None:
+        token_hex = load_token()
+        if token_hex:
+            log(f"Loaded saved token: {token_hex[:8]}...")
+
     log(f"Scanning for pendant (service {SERVICE_UUID})...")
 
     scan_count = 0
@@ -481,10 +534,11 @@ async def main(
         try:
             async with BleakClient(device, timeout=10) as client:
                 log(f"Connected (MTU: {client.mtu_size}).")
-                paired = await perform_pairing_handshake(client, token_hex)
+                paired, token_hex = await perform_pairing_handshake(client, token_hex)
                 if not paired:
                     log("Pairing failed, disconnecting.")
                     continue
+                save_token(token_hex)
 
                 if bootloader:
                     await client.write_gatt_char(
@@ -498,6 +552,7 @@ async def main(
                 synced, saved_recordings = await sync_recordings(
                     client,
                     openai_client,
+                    debug=debug,
                 )
                 log(f"Sync complete, {synced} file(s) transferred.")
         except TimeoutError:
@@ -528,6 +583,11 @@ if __name__ == "__main__":
         action="store_true",
         help="Send the enter-bootloader command and exit.",
     )
+    parser.add_argument(
+        "--debug",
+        action="store_true",
+        help="Save raw .ima and decoded .wav alongside .mp3 files.",
+    )
     args = parser.parse_args()
 
     if args.token is not None:
@@ -537,4 +597,4 @@ if __name__ == "__main__":
             print("Error: --token must be exactly 32 hexadecimal characters.")
             raise SystemExit(1)
 
-    asyncio.run(main(token_hex=args.token, bootloader=args.bootloader))
+    asyncio.run(main(token_hex=args.token, bootloader=args.bootloader, debug=args.debug))
