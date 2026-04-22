@@ -60,9 +60,9 @@ static const int pin_battery = 38;      // Battery voltage via 1:1 divider (ADC1
 static const int pin_pdm_clk = 0;
 static const int pin_pdm_data = 34;
 #elif defined(BOARD_M5STICKS3)
-// M5StickS3 pin mapping. Buttons are read via M5Unified (BtnA=35, BtnB=37)
-// but we still need pin_button for ext0 deep sleep wakeup.
-static const int pin_button = 35;       // BtnA (front button), for wakeup
+// M5StickS3 pin mapping. Buttons are read via M5Unified (BtnA=GPIO11,
+// BtnB=GPIO12) but we still need pin_button for ext0 deep sleep wakeup.
+static const int pin_button = 11;       // BtnA (front button), for wakeup
 // Mic I2S pins are managed by M5Unified (internal_mic=true).
 #else
 static const int pin_button = 2;
@@ -93,6 +93,12 @@ static bool tft_ready = false;
 static const unsigned long display_timeout_ms = 3000;
 static unsigned long display_off_at_ms = 0;
 static bool display_is_on = false;
+#endif
+
+// Dev mode: hold BtnB at boot to disable automatic sleep. Useful for
+// iterative flashing during development.
+#ifdef BOARD_M5STICKS3
+static bool dev_mode = false;
 #endif
 
 // Forward declaration so display helpers can read battery voltage.
@@ -642,8 +648,16 @@ static void m5_display_init() {
   m5_display_ready = true;
 }
 
+static uint16_t cached_battery_mv = 0;
+
 static void m5_draw_battery() {
   uint16_t mv = read_battery_millivolts();
+  if (mv != 0) {
+    cached_battery_mv = mv;
+  } else {
+    Serial.printf("[display] battery I2C read returned 0, using cached %u mV\r\n", cached_battery_mv);
+    mv = cached_battery_mv;
+  }
   if (mv == 0) return;
   int pct = (int)((mv - bat_mv_empty) * 100 / (bat_mv_full - bat_mv_empty));
   if (pct < 0) pct = 0;
@@ -814,9 +828,10 @@ static void configure_button_wakeup() {
   esp_sleep_enable_ext0_wakeup((gpio_num_t)pin_button, 0);
   esp_sleep_enable_ext1_wakeup(1ULL << pin_button_pwr, ESP_EXT1_WAKEUP_ALL_LOW);
 #elif defined(BOARD_M5STICKS3)
-  // M5StickS3: no wakeup needed — device stays awake, user powers off
-  // via hardware power button.  configure_button_wakeup() is still called
-  // at boot but this board is a no-op.
+  // BtnA on GPIO 11 is an RTC GPIO — use ext0 wakeup with active-LOW.
+  esp_sleep_enable_ext0_wakeup((gpio_num_t)pin_button, 0);
+  rtc_gpio_pullup_en((gpio_num_t)pin_button);
+  rtc_gpio_pulldown_dis((gpio_num_t)pin_button);
 #else
   esp_sleep_enable_ext0_wakeup((gpio_num_t)pin_button, 0);
 #ifndef BOARD_XIAO_SENSE
@@ -849,10 +864,14 @@ static void enter_deep_sleep() {
   gpio_hold_en((gpio_num_t)pin_pdm_clk);
   gpio_deep_sleep_hold_en();
 #elif defined(BOARD_M5STICKS3)
-  // M5StickS3: never enters software-managed sleep.  The user powers off
-  // via the hardware power button (hold > 6s).  This function should not
-  // be reached for this board.
-  return;
+  // Power down the ES8311 codec via PMIC before sleeping.
+  M5.Mic.end();
+  M5.In_I2C.bitOff(0x6E, 0x11, 0b00001000, 100000);
+  // Power off the PMIC to ensure the green LED turns off. The device wakes
+  // via the hardware power button (not BtnA). powerOff() internally calls
+  // esp_deep_sleep_start() so code after it is unreachable.
+  Serial.printf("[sleep] PMIC power off\r\n");
+  M5.Power.powerOff();
 #elif !defined(BOARD_XIAO_SENSE)
   // Hold the mic power pin LOW during deep sleep so the INMP441's internal
   // pull-up cannot draw current while the chip is sleeping.
@@ -1785,9 +1804,8 @@ void setup() {
   configure_button_wakeup();
 
 #if defined(BOARD_M5STICKS3)
-  // M5StickS3 stays awake after boot — no software sleep.  The user
-  // controls power via the hardware power button.
-  Serial.printf("[setup] M5StickS3 always-on boot\r\n");
+  esp_sleep_wakeup_cause_t wakeup_cause = esp_sleep_get_wakeup_cause();
+  Serial.printf("[setup] wakeup_cause=%d (EXT0=%d)\r\n", wakeup_cause, ESP_SLEEP_WAKEUP_EXT0);
 
 #if DEBUG
   // === Boot-time mic diagnostic using M5Unified ===
@@ -1867,8 +1885,14 @@ void setup() {
   Serial.printf("[diag] --- M5Unified mic diagnostic end ---\r\n");
 #endif
 
-  show_status_screen();
-  ble_active_until_milliseconds = millis() + display_timeout_ms;
+  if (wakeup_cause != ESP_SLEEP_WAKEUP_EXT0) {
+    // Fresh boot (hardware power button) — show status, sleep after timeout.
+    // Use a longer window (10s) since every boot is a power-button boot and
+    // the user may need time to press BtnA to record.
+    Serial.printf("[setup] not EXT0, showing status then sleeping\r\n");
+    show_status_screen();
+    ble_active_until_milliseconds = millis() + 10000;
+  }
 #else
   esp_sleep_wakeup_cause_t wakeup_cause = esp_sleep_get_wakeup_cause();
   Serial.printf("[setup] wakeup_cause=%d (EXT0=%d, EXT1=%d)\r\n", wakeup_cause, ESP_SLEEP_WAKEUP_EXT0, ESP_SLEEP_WAKEUP_EXT1);
@@ -1894,8 +1918,14 @@ void setup() {
   remove_empty_recordings();
 
 #if defined(BOARD_M5STICKS3)
-  // M5Unified manages BtnA on GPIO 35 — use its API, not raw digitalRead.
+  // M5Unified manages BtnA on GPIO 11 — use its API, not raw digitalRead.
   M5.update();
+  // Dev mode: hold BtnB at boot to keep device awake for flashing.
+  if (M5.BtnB.isPressed()) {
+    dev_mode = true;
+    Serial.printf("[setup] BtnB held at boot — dev mode, sleep disabled\r\n");
+    m5_display_show("DEV MODE", "sleep off", COLOR_STATUS);
+  }
   if (M5.BtnA.isPressed()) {
     record_and_save();
   }
@@ -1910,7 +1940,7 @@ void setup() {
   // Refresh the status screen and BLE window after any recording attempt
   // so the user sees the result before the device sleeps again.
   show_status_screen();
-  ble_active_until_milliseconds = millis() + display_timeout_ms;
+  ble_active_until_milliseconds = millis() + 10000;
 #endif
 }
 
@@ -2047,23 +2077,25 @@ void loop() {
     }
   }
 
-#if !defined(BOARD_M5STICKS3)
-  if (button_state == HIGH && hard_sleep_deadline_milliseconds != 0 &&
-      !client_connected &&
-      (long)(millis() - hard_sleep_deadline_milliseconds) >= 0) {
-    enter_deep_sleep();
-  }
-
-  if (sleep_requested ||
-      (!client_connected && command_queue_head == command_queue_tail && button_state == HIGH &&
-       !ble_window_active())) {
-    sleep_requested = false;
-    enter_deep_sleep();
-  }
-#else
-  // M5StickS3: no software sleep.  Just clear the flag if set.
-  sleep_requested = false;
+#ifdef BOARD_M5STICKS3
+  if (dev_mode) {
+    sleep_requested = false;  // Discard sleep requests in dev mode.
+  } else
 #endif
+  {
+    if (button_state == HIGH && hard_sleep_deadline_milliseconds != 0 &&
+        !client_connected &&
+        (long)(millis() - hard_sleep_deadline_milliseconds) >= 0) {
+      enter_deep_sleep();
+    }
+
+    if (sleep_requested ||
+        (!client_connected && command_queue_head == command_queue_tail && button_state == HIGH &&
+         !ble_window_active())) {
+      sleep_requested = false;
+      enter_deep_sleep();
+    }
+  }
 
 #ifdef BOARD_M5STICKCPLUS2
   // BtnB: short press = force BLE advertising, long press (>=1s) = oblique strategy.

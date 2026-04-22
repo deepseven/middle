@@ -2,6 +2,43 @@
 
 ## 2026-04-22
 
+### M5StickS3: deep sleep, battery caching, dev mode, ES8311 codec mic
+
+Revamped the M5StickS3 port from always-on to deep sleep, fixed battery
+display, added developer mode, and switched to the M5Unified-managed ES8311
+codec microphone.
+
+**Deep sleep (ext0 wakeup on GPIO 11):** The earlier "always-on" model was
+caused by an incorrect button GPIO mapping (GPIO 35 is not an RTC GPIO on
+ESP32-S3). BtnA is actually on GPIO 11, which is RTC-capable, so standard
+ext0 deep sleep wakeup now works. Before sleeping, the firmware powers down
+the ES8311 codec via `M5.In_I2C.bitOff(0x6E, 0x11, ...)` and calls
+`M5.Power.powerOff()`. Deep sleep current is <100 µA.
+
+**Battery percentage caching:** `M5.Power.getBatteryVoltage()` (PY32 PMIC
+I2C read) succeeds on the first call after boot but returns 0 on subsequent
+calls. A static `cached_battery_mv` variable preserves the last successful
+reading and is used as a fallback, so battery % now appears on all display
+screens.
+
+**Dev mode:** Hold BtnB at boot to disable automatic sleep. The display shows
+"DEV MODE / sleep off". Useful for iterative flashing during development
+since the COM port disappears during deep sleep.
+
+**ES8311 codec mic:** Switched from raw PDM I2S to M5Unified's
+`Mic_Class` with `cfg.internal_mic = true`. M5Unified manages the ES8311
+codec's I2C configuration and I2S bus. Speaker must be stopped
+(`cfg.internal_spk = false` + `Speaker.end()`) before mic works due to
+the mono shared codec.
+
+**Files changed:**
+- `src/main.cpp` — GPIO 11/12 button mapping, ext0 wakeup, battery caching,
+  dev mode, ES8311 mic via M5Unified, PMIC power-off in enter_deep_sleep()
+- `ARCHITECTURE.md` — updated M5StickS3 description (ES8311 codec, deep
+  sleep model, sleep current)
+- `HOW-TO-M5STICKS3.md` — rewritten power model section, updated GPIO table,
+  board comparison table, usage instructions, and troubleshooting
+
 ### M5StickS3 board support + PlatformIO convenience script
 
 Added full support for the M5StickS3 (K147) as a fourth board variant. This

@@ -26,8 +26,8 @@ fastest BLE transfer path in the Middle firmware.
 
 | Function | GPIO | Notes |
 |---|---|---|
-| Front button (BtnA) | GPIO 35 | M5Unified `M5.BtnA`, active LOW |
-| Side button (BtnB) | GPIO 37 | M5Unified `M5.BtnB`, active LOW |
+| Front button (BtnA) | GPIO 11 | M5Unified `M5.BtnA`, active LOW |
+| Side button (BtnB) | GPIO 12 | M5Unified `M5.BtnB`, active LOW |
 | Audio codec | I2S (managed by M5Unified) | ES8311 — mic and speaker, mono shared |
 | Display | SPI (managed by M5Unified) | ST7789V2, 135×240 |
 | Power management | I2C: SDA=GPIO 48, SCL=GPIO 47 | PY32 PMIC at 0x6E |
@@ -45,7 +45,7 @@ fastest BLE transfer path in the Middle firmware.
 | Display library | — | U8g2 | TFT_eSPI | M5Unified/M5GFX |
 | Battery reading | ADC on GPIO 1 | Not available | ADC on GPIO 38 | PY32 PMIC via M5Unified |
 | Power management | Mic power gate | None | GPIO 4 power hold | PY32 PMIC (hardware button) |
-| Sleep model | Deep sleep (ext0) | Deep sleep (ext0) | Deep sleep (ext0+ext1) | Always-on (hardware power) |
+| Sleep model | Deep sleep (ext0) | Deep sleep (ext0) | Deep sleep (ext0+ext1) | Deep sleep (ext0) |
 | USB | Native USB CDC | Native USB CDC | CH9102 UART bridge | USB-Serial/JTAG (CDC) |
 
 ---
@@ -109,23 +109,28 @@ You should see `SUCCESS` in the terminal output.
 
 ## Step 5: Usage
 
-After flashing, the M5StickS3 stays awake and shows a status screen (file
-count and free storage). Unlike other boards, it does **not** enter deep
-sleep — see [Always-on power model](#always-on-power-model-no-deep-sleep)
-below for why.
+After flashing, the M5StickS3 shows a status screen briefly on first
+power-on, then enters **deep sleep** within a few seconds.  This is the same
+behavior as other Middle boards — the device stays dormant until BtnA is
+pressed.
 
-- **Record**: Press and hold the front button (BtnA). The TFT shows
-  "Recording..." with a red indicator. Release when done.
+- **Record**: Press BtnA (front button) to wake the device and start
+  recording. The TFT shows "Recording..." with a red indicator.
+  Release when done.
 - **Auto-sync**: After recording, the device advertises via BLE for
   ~10 seconds. If a sync client connects, recordings transfer automatically.
-- **Force sync**: Short-press the side button (BtnB) to start BLE
-  advertising manually (useful to sync without making a new recording).
+  Then the device returns to deep sleep.
+- **Force sync**: Short-press BtnB (side button) during the awake period
+  to start BLE advertising manually.
 - **Oblique strategy**: Long-press BtnB (≥1 second) to display a random
   Oblique Strategy on the color TFT.
 - **Status**: The device shows file count and free storage on the TFT
   when BLE advertising starts.
-- **Power off**: Hold the hardware power button for 6+ seconds. There is
-  no software power-off.
+- **Power off**: Hold the hardware power button for 6+ seconds. The PY32
+  PMIC cuts power entirely.
+- **USB note**: During deep sleep the ESP32-S3's USB CDC is powered down,
+  so the COM port disappears from the host. It reappears when the device
+  wakes (BtnA press or power cycle).
 
 ---
 
@@ -228,33 +233,34 @@ The speaker must be stopped before the mic can operate (mono codec):
 codec fails to reinitialize correctly after `end()` + `begin()`. Keep the
 mic alive across all recording sessions.
 
-### Power model: always-on, no deep sleep
+### Power model: deep sleep with ext0 wakeup
 
-This is the biggest behavioral difference from all other boards.
+Earlier versions of the M5StickS3 port used an always-on model because
+the button GPIO was incorrectly mapped to GPIO 35 (which is not an RTC
+GPIO on ESP32-S3).  The actual M5StickS3 BtnA is on **GPIO 11**, which
+**is** an RTC GPIO, so ext0 deep sleep wakeup works.
 
-Every other Middle board uses a **deep sleep** power model:
-1. Device boots, checks wakeup cause.
-2. If not woken by button press, immediately enters deep sleep.
-3. Button press via `ext0_wakeup` wakes the device, records, syncs, sleeps.
+The M5StickS3 now uses the same deep sleep model as all other boards:
+1. Device boots, checks `esp_sleep_get_wakeup_cause()`.
+2. If not woken by BtnA (ext0), shows status screen briefly, then sleeps.
+3. BtnA press triggers ext0 wakeup → device reboots → records → syncs via
+   BLE → sleeps again.
 
-The M5StickS3 **cannot use this model** because:
-- The PY32 PMIC controls power to the ESP32. The user turns the device on/off
-  via the hardware power button (long press = off).
-- `esp_deep_sleep_start()` would shut down the ESP32, but the PMIC would keep
-  power flowing — the device would immediately reboot into a loop.
-- There is no `ext0`-capable GPIO wakeup path that works with M5Unified's
-  button management.
+Before entering deep sleep, the firmware:
+- Turns off the display (`M5.Display.sleep()`).
+- Stops BLE advertising.
+- Powers down the ES8311 codec by clearing the PMIC register
+  (`M5.In_I2C.bitOff(0x6E, 0x11, 0b00001000)`).
+- Calls `M5.Mic.end()` to release I2S resources.
+- Calls `esp_deep_sleep_start()`.
 
-Instead, the M5StickS3 uses an **always-on** model:
-1. Device boots, shows status screen, stays awake.
-2. `M5.BtnA.wasPressed()` triggers recording (in `loop()`).
-3. `M5.BtnB` short press triggers BLE sync, long press shows oblique strategy.
-4. Display auto-off timeout still applies (3 seconds).
-5. User powers off by holding the hardware power button for 6+ seconds.
+The PY32 PMIC continues supplying power to the ESP32 during deep sleep
+(unlike a full power-off), allowing the RTC domain to monitor GPIO 11
+for a button press.  Deep sleep current is typically <100 µA.
 
-The `configure_button_wakeup()` function is a no-op for the M5StickS3, and
-`enter_deep_sleep()` should never be reached (it turns off the display as a
-safety measure but does not call `esp_deep_sleep_start()`).
+**USB CDC during sleep:** The ESP32-S3's built-in USB CDC is powered by
+the USB peripheral, which is off during deep sleep.  The serial port
+disappears from the host while sleeping and reappears on wakeup.
 
 ### Board detection: fallback_board required
 
@@ -330,8 +336,8 @@ at a glance.
 | Recording loop | `while (digitalRead(...) == LOW)` | `while (M5.BtnA.isPressed())` with `M5.update()` | Direct GPIO read unreliable under M5Unified |
 | Battery voltage | ADC with voltage divider | `M5.Power.getBatteryVoltage()` | PY32 PMIC, no ADC pin exposed |
 | I2S mic | Direct init (ESP-IDF) | M5Unified `Mic_Class` (async DMA) | ES8311 codec requires M5Unified management |
-| Power model | Deep sleep + ext0 wakeup | Always-on, hardware power button | PMIC prevents software-managed deep sleep |
-| Sleep on boot | Yes (if not button wakeup) | No (stays awake) | Always-on model |
+| Power model | Deep sleep + ext0 wakeup | Always-on, hardware power button | Deep sleep + ext0 wakeup on GPIO 11 |
+| Sleep on boot | Yes (if not button wakeup) | No (stays awake) | Yes (if not button wakeup) |
 | Board detection | N/A | `cfg.fallback_board = board_M5StickS3` | Prevent misidentification as AtomS3R |
 | PlatformIO board | `pico32` / `seeed_xiao_esp32s3` | `esp32-s3-devkitc-1` | No dedicated PIO board def for S3-PICO-1 |
 | Speaker init | N/A | `cfg.internal_spk = false` + `Speaker.end()` | Mono codec — speaker must be off for mic |
@@ -350,5 +356,5 @@ at a glance.
 | Recording too quiet | The firmware applies 4× software gain (`pdm_gain_shift = 2`). If still quiet, increase to 3 (8×) in the `BOARD_M5STICKS3` section of `main.cpp`. |
 | Build error: M5Unified not found | Run `pio pkg install -e m5stick_s3` to force library download. |
 | Battery always reads 0 | Board detection failed — ensure `cfg.fallback_board = board_M5StickS3` is set before `M5.begin()`. |
-| Device reboots in a loop | If `enter_deep_sleep()` is called, the PMIC keeps power flowing and the ESP32 reboots. The always-on code path should prevent this — check that `BOARD_M5STICKS3` is defined. |
+| Device reboots in a loop | Check that BtnA (GPIO 11) has a proper pull-up. Verify `BOARD_M5STICKS3` is defined. |
 | Linker error: "reopening .o: No such file" | Stale build artifacts. Run `.\pio.ps1 clean s3` and rebuild. |

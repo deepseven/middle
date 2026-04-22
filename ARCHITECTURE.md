@@ -58,10 +58,10 @@ middle/
     on expansion board, `BOARD_XIAO_SENSE` build flag
   - `m5stick_c_plus2` (M5StickC Plus2): ESP32-PICO-V3-02, built-in SPM1423
     PDM mic, ST7789V2 TFT display (135×240), `BOARD_M5STICKCPLUS2` build flag
-  - `m5stick_s3` (M5StickS3): ESP32-S3-PICO-1, built-in SPM1423 PDM mic,
+  - `m5stick_s3` (M5StickS3): ESP32-S3-PICO-1, built-in ES8311 codec mic,
     ST7789V2 TFT display (135×240) via M5Unified/M5GFX, PY32 PMIC for
-    battery management, `BOARD_M5STICKS3` build flag — always-on power model
-    (see `HOW-TO-M5STICKS3.md` for details)
+    battery management, `BOARD_M5STICKS3` build flag — deep sleep with ext0
+    wakeup on GPIO 11 (see `HOW-TO-M5STICKS3.md` for details)
 - **Framework**: Arduino via PlatformIO (`platformio.ini`)
 - **BLE**: Arduino BLE wrapper over NimBLE; `ble_gatts_notify_custom()` called
   directly to enable retry on mbuf exhaustion (the Arduino wrapper aborts on
@@ -306,7 +306,7 @@ Key details:
 ## Firmware device lifecycle
 
 ```
-[Deep sleep, ~7µA devkit / ~3mA XIAO] → button press (ext0 wakeup)
+[Deep sleep, ~7µA devkit / ~3mA XIAO / <100µA M5StickS3] → button press (ext0 wakeup)
   → if button LOW: record IMA ADPCM to LittleFS
   → if duration < 1000ms: discard (sync-only tap)
   → start BLE advertising (10 s window, 30 s hard deadline)
