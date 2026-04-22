@@ -11,6 +11,9 @@
 #elif defined(BOARD_M5STICKCPLUS2)
 #include <driver/i2s_pdm.h>
 #include <TFT_eSPI.h>
+#elif defined(BOARD_M5STICKS3)
+#include <driver/i2s_pdm.h>
+#include <M5Unified.h>
 #else
 #include <driver/i2s_std.h>
 #endif
@@ -56,6 +59,13 @@ static const int pin_battery = 38;      // Battery voltage via 1:1 divider (ADC1
 // SPM1423 PDM microphone pins (built into device).
 static const int pin_pdm_clk = 0;
 static const int pin_pdm_data = 34;
+#elif defined(BOARD_M5STICKS3)
+// M5StickS3 pin mapping. Buttons are read via M5Unified (BtnA=35, BtnB=37)
+// but we still need pin_button for ext0 deep sleep wakeup.
+static const int pin_button = 35;       // BtnA (front button), for wakeup
+// SPM1423 PDM microphone pins (built into device).
+static const int pin_pdm_clk = 0;
+static const int pin_pdm_data = 1;      // Different from Plus2's GPIO 34
 #else
 static const int pin_button = 2;
 static const int pin_battery = 1;
@@ -81,7 +91,7 @@ static bool tft_ready = false;
 
 // Display auto-off to save power. After any display update the screen stays
 // on for display_timeout_ms then turns off automatically.
-#if defined(BOARD_XIAO_SENSE) || defined(BOARD_M5STICKCPLUS2)
+#if defined(BOARD_XIAO_SENSE) || defined(BOARD_M5STICKCPLUS2) || defined(BOARD_M5STICKS3)
 static const unsigned long display_timeout_ms = 3000;
 static unsigned long display_off_at_ms = 0;
 static bool display_is_on = false;
@@ -95,6 +105,9 @@ static uint16_t read_battery_millivolts();
 #if defined(BOARD_M5STICKCPLUS2)
 static const uint16_t bat_mv_empty = 3300;  // 120 mAh LiPo, cut-off ~3.3 V
 static const uint16_t bat_mv_full  = 4200;  // Fully charged Li-ion/LiPo
+#elif defined(BOARD_M5STICKS3)
+static const uint16_t bat_mv_empty = 3300;  // 120 mAh LiPo
+static const uint16_t bat_mv_full  = 4200;
 #elif !defined(BOARD_XIAO_SENSE)
 static const uint16_t bat_mv_empty = 3300;  // DevKitC external Li-ion cell
 static const uint16_t bat_mv_full  = 4200;
@@ -115,6 +128,9 @@ static const int pdm_gain_shift = 3;
 #elif defined(BOARD_M5STICKCPLUS2)
 // Software gain for the M5StickC Plus2's SPM1423 PDM mic.
 // 8x gain (shift 3).
+static const int pdm_gain_shift = 3;
+#elif defined(BOARD_M5STICKS3)
+// Software gain for the M5StickS3's SPM1423 PDM mic.
 static const int pdm_gain_shift = 3;
 #endif
 
@@ -266,6 +282,8 @@ static const uint8_t command_ack_received = 0x02;
 static const uint8_t command_sync_done = 0x03;
 static const uint8_t command_start_stream = 0x04;
 static const uint8_t command_enter_bootloader = 0x05;
+static const uint8_t command_skip_file = 0x06;
+static const uint8_t command_unpair = 0x07;
 
 static const unsigned long ble_keepalive_milliseconds = 10000;
 
@@ -457,7 +475,10 @@ static void tft_show_wrapped(const char *text, uint8_t size = 2) {
   tft.setTextSize(2);
   display_off_at_ms = millis() + display_timeout_ms;
 }
+#endif // BOARD_M5STICKCPLUS2 tft functions
 
+// Oblique strategies array shared by M5StickC Plus2 and M5StickS3.
+#if defined(BOARD_M5STICKCPLUS2) || defined(BOARD_M5STICKS3)
 static const char *const oblique_strategies[] = {
   "A line has two sides",
   "Abandon desire",
@@ -562,20 +583,135 @@ static const char *const oblique_strategies[] = {
 static const int oblique_strategy_count =
     sizeof(oblique_strategies) / sizeof(oblique_strategies[0]);
 
+#ifdef BOARD_M5STICKCPLUS2
 static void show_oblique_strategy() {
   uint32_t index = esp_random() % oblique_strategy_count;
   tft_show_wrapped(oblique_strategies[index]);
-  // Give more time to read the strategy text.
+  display_off_at_ms = millis() + 15000;
+}
+#endif // BOARD_M5STICKCPLUS2 show_oblique_strategy
+#endif // shared oblique strategies
+
+#ifdef BOARD_M5STICKS3
+// --- M5StickS3 display via M5Unified ---
+// Color theme: use the color TFT for visual state differentiation.
+static const uint32_t COLOR_BG         = 0x000000u;  // Black
+static const uint32_t COLOR_TEXT       = 0xFFFFFFu;  // White
+static const uint32_t COLOR_RECORDING  = 0xFF3333u;  // Red
+static const uint32_t COLOR_SYNCING    = 0x3399FFu;  // Blue
+static const uint32_t COLOR_SYNCED     = 0x33CC66u;  // Green
+static const uint32_t COLOR_STATUS     = 0xFFCC00u;  // Amber
+static const uint32_t COLOR_DIM        = 0x666666u;  // Grey
+
+static bool m5_display_ready = false;
+
+static void m5_display_init() {
+  auto cfg = M5.config();
+  cfg.fallback_board = m5::board_t::board_M5StickS3;
+  M5.begin(cfg);
+  M5.Display.setRotation(1);  // Landscape: 240x135
+  M5.Display.fillScreen(TFT_BLACK);
+  M5.Display.setTextSize(2);
+  display_is_on = false;
+  m5_display_ready = true;
+}
+
+static void m5_draw_battery() {
+  uint16_t mv = read_battery_millivolts();
+  if (mv == 0) return;
+  int pct = (int)((mv - bat_mv_empty) * 100 / (bat_mv_full - bat_mv_empty));
+  if (pct < 0) pct = 0;
+  if (pct > 100) pct = 100;
+  char bat[8];
+  snprintf(bat, sizeof(bat), "%d%%", pct);
+  M5.Display.setTextSize(1);
+  M5.Display.setTextColor(COLOR_DIM, COLOR_BG);
+  M5.Display.drawString(bat, 240 - strlen(bat) * 6 - 4, 135 - 10);
+  M5.Display.setTextSize(2);
+  M5.Display.setTextColor(COLOR_TEXT, COLOR_BG);
+}
+
+static void m5_display_show(const char *line1, const char *line2 = nullptr,
+                            uint32_t accent_color = COLOR_TEXT) {
+  if (!m5_display_ready) return;
+  if (!display_is_on) {
+    M5.Display.wakeup();
+    M5.Display.setBrightness(80);
+    display_is_on = true;
+  }
+  M5.Display.fillScreen(TFT_BLACK);
+  // Draw a small colored accent bar at the top to indicate state.
+  M5.Display.fillRect(0, 0, 240, 4, accent_color);
+  M5.Display.setTextColor(COLOR_TEXT, COLOR_BG);
+  if (line1) M5.Display.drawString(line1, 10, 30);
+  if (line2) M5.Display.drawString(line2, 10, 70);
+  m5_draw_battery();
+  display_off_at_ms = millis() + display_timeout_ms;
+}
+
+static void m5_display_off() {
+  if (!m5_display_ready) return;
+  M5.Display.fillScreen(TFT_BLACK);
+  M5.Display.sleep();
+  M5.Display.setBrightness(0);
+  display_is_on = false;
+}
+
+// Word-wrapping text display for longer messages (oblique strategies).
+static void m5_display_show_wrapped(const char *text, uint8_t size = 2) {
+  if (!m5_display_ready) return;
+  if (!display_is_on) {
+    M5.Display.wakeup();
+    M5.Display.setBrightness(80);
+    display_is_on = true;
+  }
+  M5.Display.fillScreen(TFT_BLACK);
+  M5.Display.setTextSize(size);
+  M5.Display.setTextColor(COLOR_STATUS, COLOR_BG);
+  int char_w = 6 * size;
+  int line_h = 8 * size + 2;
+  int max_chars = (240 - 10) / char_w;
+  int y = 10;
+  const char *p = text;
+  while (*p && y + line_h <= 135) {
+    int len = strlen(p);
+    int line_len = (len <= max_chars) ? len : max_chars;
+    if (len > max_chars) {
+      int last_space = -1;
+      for (int i = 0; i < line_len; i++) {
+        if (p[i] == ' ') last_space = i;
+      }
+      if (last_space > 0) line_len = last_space;
+    }
+    char line_buf[42];
+    int copy_len = (line_len < (int)sizeof(line_buf) - 1) ? line_len : (int)sizeof(line_buf) - 1;
+    memcpy(line_buf, p, copy_len);
+    line_buf[copy_len] = '\0';
+    M5.Display.drawString(line_buf, 5, y);
+    y += line_h;
+    p += line_len;
+    while (*p == ' ') p++;
+  }
+  M5.Display.setTextSize(2);
+  M5.Display.setTextColor(COLOR_TEXT, COLOR_BG);
+  display_off_at_ms = millis() + display_timeout_ms;
+}
+
+static void show_oblique_strategy() {
+  uint32_t index = esp_random() % oblique_strategy_count;
+  m5_display_show_wrapped(oblique_strategies[index]);
   display_off_at_ms = millis() + 15000;
 }
 #endif
 
 // Turn off the display if the auto-off timer has expired.
-#if defined(BOARD_XIAO_SENSE) || defined(BOARD_M5STICKCPLUS2)
+#if defined(BOARD_XIAO_SENSE) || defined(BOARD_M5STICKCPLUS2) || defined(BOARD_M5STICKS3)
 static void display_check_timeout() {
   if (display_is_on && (long)(millis() - display_off_at_ms) >= 0) {
 #ifdef BOARD_XIAO_SENSE
     oled_off();
+#elif defined(BOARD_M5STICKS3)
+    m5_display_off();
 #else
     tft_off();
 #endif
@@ -599,7 +735,7 @@ static bool ble_window_active() {
   return (long)(ble_active_until_milliseconds - millis()) > 0;
 }
 
-#if defined(BOARD_XIAO_SENSE) || defined(BOARD_M5STICKCPLUS2)
+#if defined(BOARD_XIAO_SENSE) || defined(BOARD_M5STICKCPLUS2) || defined(BOARD_M5STICKS3)
 static uint32_t free_storage_kb();
 #endif
 
@@ -622,6 +758,11 @@ static void start_ble_advertising() {
   snprintf(buf, sizeof(buf), "%u files %luKB",
            (unsigned)pending_recording_count, (unsigned long)free_storage_kb());
   tft_show("BLE Active", buf);
+#elif defined(BOARD_M5STICKS3)
+  char buf[22];
+  snprintf(buf, sizeof(buf), "%u files %luKB",
+           (unsigned)pending_recording_count, (unsigned long)free_storage_kb());
+  m5_display_show("BLE Active", buf, COLOR_SYNCING);
 #endif
   sync_total_files = pending_recording_count;
 }
@@ -646,6 +787,9 @@ static void configure_button_wakeup() {
   // behaves like "wake when this pin goes LOW".
   esp_sleep_enable_ext0_wakeup((gpio_num_t)pin_button, 0);
   esp_sleep_enable_ext1_wakeup(1ULL << pin_button_pwr, ESP_EXT1_WAKEUP_ALL_LOW);
+#elif defined(BOARD_M5STICKS3)
+  // M5StickS3: BtnA (GPIO 35) for ext0 wakeup.
+  esp_sleep_enable_ext0_wakeup((gpio_num_t)pin_button, 0);
 #else
   esp_sleep_enable_ext0_wakeup((gpio_num_t)pin_button, 0);
 #ifndef BOARD_XIAO_SENSE
@@ -661,6 +805,8 @@ static void enter_deep_sleep() {
   oled_off();
 #elif defined(BOARD_M5STICKCPLUS2)
   tft_off();
+#elif defined(BOARD_M5STICKS3)
+  m5_display_off();
 #endif
   if (ble_advertising != nullptr) {
     ble_advertising->stop();
@@ -668,7 +814,16 @@ static void enter_deep_sleep() {
   delay(20);
 #ifdef BOARD_M5STICKCPLUS2
   // Keep the power hold pin HIGH during deep sleep so the device stays on.
+  // Hold TFT backlight LOW so it cannot float HIGH and drain the battery.
+  // Hold PDM clock LOW so the mic's internal pull-up on GPIO 0 does not
+  // keep it clocked during sleep.
   gpio_hold_en((gpio_num_t)pin_power_hold);
+  gpio_hold_en((gpio_num_t)TFT_BL);
+  gpio_hold_en((gpio_num_t)pin_pdm_clk);
+  gpio_deep_sleep_hold_en();
+#elif defined(BOARD_M5STICKS3)
+  // M5StickS3: PY32 PMIC handles power management. Hold PDM clock LOW.
+  gpio_hold_en((gpio_num_t)pin_pdm_clk);
   gpio_deep_sleep_hold_en();
 #elif !defined(BOARD_XIAO_SENSE)
   // Hold the mic power pin LOW during deep sleep so the INMP441's internal
@@ -782,7 +937,7 @@ static int count_recordings() {
   return count;
 }
 
-#if defined(BOARD_XIAO_SENSE) || defined(BOARD_M5STICKCPLUS2)
+#if defined(BOARD_XIAO_SENSE) || defined(BOARD_M5STICKCPLUS2) || defined(BOARD_M5STICKS3)
 static uint32_t free_storage_kb() {
   if (!ensure_littlefs_ready()) return 0;
   return (LittleFS.totalBytes() - LittleFS.usedBytes()) / 1024;
@@ -797,6 +952,8 @@ static void show_status_screen() {
   snprintf(line2, sizeof(line2), "%lu KB free", (unsigned long)free_kb);
 #ifdef BOARD_XIAO_SENSE
   oled_show(line1, line2);
+#elif defined(BOARD_M5STICKS3)
+  m5_display_show(line1, line2, COLOR_STATUS);
 #else
   tft_show(line1, line2);
 #endif
@@ -841,7 +998,7 @@ static const size_t i2s_read_frames = 512;
 
 static i2s_chan_handle_t i2s_rx_channel = nullptr;
 
-#if defined(BOARD_XIAO_SENSE) || defined(BOARD_M5STICKCPLUS2)
+#if defined(BOARD_XIAO_SENSE) || defined(BOARD_M5STICKCPLUS2) || defined(BOARD_M5STICKS3)
 static bool i2s_init() {
   i2s_chan_config_t channel_config = I2S_CHANNEL_DEFAULT_CONFIG(
       I2S_NUM_AUTO, I2S_ROLE_MASTER);
@@ -937,12 +1094,14 @@ static bool record_and_save() {
   oled_show("Recording...");
 #elif defined(BOARD_M5STICKCPLUS2)
   tft_show("Recording...");
+#elif defined(BOARD_M5STICKS3)
+  m5_display_show("Recording...", nullptr, COLOR_RECORDING);
 #else
   digitalWrite(pin_mic_power, HIGH);
 #endif
 
   if (!i2s_init()) {
-#if !defined(BOARD_XIAO_SENSE) && !defined(BOARD_M5STICKCPLUS2)
+#if !defined(BOARD_XIAO_SENSE) && !defined(BOARD_M5STICKCPLUS2) && !defined(BOARD_M5STICKS3)
     digitalWrite(pin_mic_power, LOW);
 #endif
     return false;
@@ -982,7 +1141,7 @@ static bool record_and_save() {
       break;
     }
 
-#if defined(BOARD_XIAO_SENSE) || defined(BOARD_M5STICKCPLUS2)
+#if defined(BOARD_XIAO_SENSE) || defined(BOARD_M5STICKCPLUS2) || defined(BOARD_M5STICKS3)
     // PDM mode produces 16-bit mono samples directly.
     static int16_t i2s_buf[i2s_read_frames];
 #else
@@ -1003,7 +1162,7 @@ static bool record_and_save() {
         DBG("[rec] i2s_channel_read error %d in discard loop\r\n", err);
         break;
       }
-#if defined(BOARD_XIAO_SENSE) || defined(BOARD_M5STICKCPLUS2)
+#if defined(BOARD_XIAO_SENSE) || defined(BOARD_M5STICKCPLUS2) || defined(BOARD_M5STICKS3)
       discarded += bytes_read / sizeof(int16_t);
 #else
       discarded += bytes_read / sizeof(int32_t) / 2;
@@ -1026,7 +1185,7 @@ static bool record_and_save() {
         break;
       }
 
-#if defined(BOARD_XIAO_SENSE) || defined(BOARD_M5STICKCPLUS2)
+#if defined(BOARD_XIAO_SENSE) || defined(BOARD_M5STICKCPLUS2) || defined(BOARD_M5STICKS3)
       size_t total_samples = bytes_read / sizeof(int16_t);
       for (size_t i = 0; i < total_samples; i++) {
         int32_t amplified = (int32_t)i2s_buf[i] << pdm_gain_shift;
@@ -1082,7 +1241,7 @@ static bool record_and_save() {
   } while (false);
 
   i2s_deinit();
-#if !defined(BOARD_XIAO_SENSE) && !defined(BOARD_M5STICKCPLUS2)
+#if !defined(BOARD_XIAO_SENSE) && !defined(BOARD_M5STICKCPLUS2) && !defined(BOARD_M5STICKS3)
   digitalWrite(pin_mic_power, LOW);
 #endif
   return recording_saved;
@@ -1235,6 +1394,9 @@ static uint16_t read_battery_millivolts() {
     sum += analogReadMilliVolts(pin_battery);
   }
   return (uint16_t)((sum / 10) * 2);
+#elif defined(BOARD_M5STICKS3)
+  // M5StickS3: battery voltage via M5Unified Power API (PY32 PMIC).
+  return (uint16_t)M5.Power.getBatteryVoltage();
 #else
   // Throwaway read to pre-charge the ADC's sample-and-hold capacitor,
   // which otherwise doesn't fully settle through the 180k voltage divider.
@@ -1298,6 +1460,25 @@ static bool nvs_write_pair_token(const uint8_t token[pairing_token_length]) {
   nvs_close(handle);
   if (err != ESP_OK) {
     DBG("[ble] nvs_set_blob/commit failed: %d\r\n", err);
+    return false;
+  }
+  return true;
+}
+
+static bool nvs_erase_pair_token() {
+  nvs_handle_t handle;
+  esp_err_t err = nvs_open(nvs_namespace, NVS_READWRITE, &handle);
+  if (err != ESP_OK) {
+    DBG("[ble] nvs_open erase failed: %d\r\n", err);
+    return false;
+  }
+  err = nvs_erase_key(handle, nvs_key_pair_token);
+  if (err == ESP_OK || err == ESP_ERR_NVS_NOT_FOUND) {
+    err = nvs_commit(handle);
+  }
+  nvs_close(handle);
+  if (err != ESP_OK) {
+    DBG("[ble] nvs_erase/commit failed: %d\r\n", err);
     return false;
   }
   return true;
@@ -1452,14 +1633,21 @@ void setup() {
 #ifdef BOARD_XIAO_SENSE
   oled_init();
 #elif defined(BOARD_M5STICKCPLUS2)
-  // Release deep sleep hold before reconfiguring the power hold pin.
+  // Release deep sleep hold before reconfiguring held pins.
   gpio_hold_dis((gpio_num_t)pin_power_hold);
+  gpio_hold_dis((gpio_num_t)TFT_BL);
+  gpio_hold_dis((gpio_num_t)pin_pdm_clk);
   gpio_deep_sleep_hold_dis();
   pinMode(pin_power_hold, OUTPUT);
   digitalWrite(pin_power_hold, HIGH);
   pinMode(pin_button_b, INPUT);
   pinMode(pin_button_pwr, INPUT);
   tft_init();
+#elif defined(BOARD_M5STICKS3)
+  // Release deep sleep hold before reconfiguring held pins.
+  gpio_hold_dis((gpio_num_t)pin_pdm_clk);
+  gpio_deep_sleep_hold_dis();
+  m5_display_init();
 #else
   // Release the GPIO hold set in enter_deep_sleep() before reconfiguring the
   // pin. If the hold is still active, pinMode() fights the latched state.
@@ -1527,7 +1715,7 @@ void loop() {
       prepare_current_file();
     } else if (command == command_start_stream) {
       stream_prepared_file();
-#if defined(BOARD_XIAO_SENSE) || defined(BOARD_M5STICKCPLUS2)
+#if defined(BOARD_XIAO_SENSE) || defined(BOARD_M5STICKCPLUS2) || defined(BOARD_M5STICKS3)
       {
         unsigned int sent = (sync_total_files > pending_recording_count)
             ? sync_total_files - pending_recording_count + 1
@@ -1537,6 +1725,8 @@ void loop() {
                  sent, (unsigned)sync_total_files);
 #ifdef BOARD_XIAO_SENSE
         oled_show("Syncing...", sync_buf);
+#elif defined(BOARD_M5STICKS3)
+        m5_display_show("Syncing...", sync_buf, COLOR_SYNCING);
 #else
         tft_show("Syncing...", sync_buf);
 #endif
@@ -1567,7 +1757,7 @@ void loop() {
         }
       }
       update_file_count();
-#if defined(BOARD_XIAO_SENSE) || defined(BOARD_M5STICKCPLUS2)
+#if defined(BOARD_XIAO_SENSE) || defined(BOARD_M5STICKCPLUS2) || defined(BOARD_M5STICKS3)
       {
         unsigned int sent = (sync_total_files > pending_recording_count)
             ? sync_total_files - pending_recording_count : sync_total_files;
@@ -1576,12 +1766,43 @@ void loop() {
                  sent, (unsigned)sync_total_files);
 #ifdef BOARD_XIAO_SENSE
         oled_show("Synced", sync_buf);
+#elif defined(BOARD_M5STICKS3)
+        m5_display_show("Synced", sync_buf, COLOR_SYNCED);
 #else
         tft_show("Synced", sync_buf);
 #endif
       }
 #endif
     } else if (command == command_sync_done) {
+    } else if (command == command_skip_file) {
+      // Client failed to transfer the current file. Delete it so the sync
+      // queue is not permanently stuck on an untransferable recording.
+      if (pending_stream_file) {
+        pending_stream_file.close();
+      }
+
+      String path_to_delete = current_stream_path;
+      if (path_to_delete.length() == 0) {
+        path_to_delete = next_recording_path();
+      }
+
+      if (path_to_delete.length() > 0) {
+        bool removed = LittleFS.remove(path_to_delete);
+        Serial.printf("[ble] skip+delete %s: %s\r\n",
+            path_to_delete.c_str(), removed ? "OK" : "FAILED");
+        if (removed) {
+          current_stream_path = "";
+        }
+      }
+      update_file_count();
+    } else if (command == command_unpair) {
+      // Erase the stored pairing token so the pendant becomes unclaimed.
+      // The authenticated client asked to release ownership.
+      if (nvs_erase_pair_token()) {
+        Serial.printf("[ble] unpaired, token erased\r\n");
+      }
+      connection_authenticated = false;
+      ble_server->disconnect(ble_server->getConnId());
     } else if (command == command_enter_bootloader) {
       // Set the ROM download mode flag before restarting so the bootloader
       // stays in USB/UART download mode rather than booting the application.
@@ -1663,7 +1884,37 @@ void loop() {
   }
 #endif
 
-#if defined(BOARD_XIAO_SENSE) || defined(BOARD_M5STICKCPLUS2)
+#ifdef BOARD_M5STICKS3
+  // M5StickS3: use M5Unified button API for BtnB.
+  // BtnB: short press = force BLE advertising, long press (>=1s) = oblique strategy.
+  M5.update();
+  if (M5.BtnB.wasPressed()) {
+    // Will check for long press below.
+  }
+  if (M5.BtnB.pressedFor(1000)) {
+    static bool btnb_long_handled = false;
+    if (!btnb_long_handled) {
+      btnb_long_handled = true;
+      show_oblique_strategy();
+    }
+    if (M5.BtnB.wasReleased()) {
+      btnb_long_handled = false;
+    }
+  } else if (M5.BtnB.wasReleased()) {
+    // Short press — force sync.
+    if (!ble_initialized) {
+      init_ble();
+      ble_initialized = true;
+    }
+    uint16_t millivolts = read_battery_millivolts();
+    voltage_characteristic->setValue(millivolts);
+    update_file_count();
+    sync_total_files = pending_recording_count;
+    start_ble_advertising();
+  }
+#endif
+
+#if defined(BOARD_XIAO_SENSE) || defined(BOARD_M5STICKCPLUS2) || defined(BOARD_M5STICKS3)
   display_check_timeout();
 #endif
 

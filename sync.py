@@ -21,6 +21,7 @@ import asyncio
 import os
 import secrets
 import struct
+import subprocess
 import time
 from datetime import datetime
 from pathlib import Path
@@ -44,6 +45,8 @@ COMMAND_ACK_RECEIVED = bytes([0x02])
 COMMAND_SYNC_DONE = bytes([0x03])
 COMMAND_START_STREAM = bytes([0x04])
 COMMAND_ENTER_BOOTLOADER = bytes([0x05])
+COMMAND_SKIP_FILE = bytes([0x06])
+COMMAND_UNPAIR = bytes([0x07])
 
 SAMPLE_RATE = 16000
 NUMBER_OF_CHANNELS = 1
@@ -355,10 +358,46 @@ async def sync_recordings(
             continue
 
         if len(audio_data) != expected_size:
-            raise RuntimeError(
-                f"Failed to transfer file {i + 1}/{file_count} after "
-                f"{MAX_FILE_TRANSFER_ATTEMPTS} attempts."
-            )
+            # Transfer failed after all retries. Save whatever partial data
+            # we received so the user can attempt recovery, then skip the
+            # file on the pendant so the sync queue is not permanently stuck.
+            partial_data = b"".join(received_chunks)
+            if partial_data:
+                timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+                partial_name = f"recording_{timestamp}_{i}_partial"
+                try:
+                    mp3_data = encode_mp3_from_ima(partial_data)
+                    partial_path = RECORDINGS_DIRECTORY / f"{partial_name}.mp3"
+                    partial_path.write_bytes(mp3_data)
+                    log(
+                        f"Saved partial recording {partial_path} "
+                        f"({len(partial_data)}/{expected_size} bytes)."
+                    )
+                    saved_recordings.append(partial_path)
+                except Exception as error:
+                    partial_path = RECORDINGS_DIRECTORY / f"{partial_name}.ima"
+                    partial_path.write_bytes(partial_data)
+                    log(
+                        f"Could not decode partial IMA, saved raw "
+                        f"{partial_path} ({len(partial_data)} bytes): {error}"
+                    )
+            else:
+                log(
+                    f"File {i + 1}/{file_count}: transfer failed with no "
+                    f"data received."
+                )
+
+            log("Sending SKIP_FILE command.")
+            try:
+                await client.write_gatt_char(
+                    CHARACTERISTIC_COMMAND_UUID, COMMAND_SKIP_FILE
+                )
+                log("SKIP_FILE write succeeded.")
+            except Exception as error:
+                log(f"SKIP_FILE write failed ({error}).")
+                return synced, saved_recordings
+            synced += 1
+            continue
 
         speed = len(audio_data) / transfer_elapsed / 1024 if transfer_elapsed > 0 else 0
         log(
@@ -414,7 +453,10 @@ async def sync_recordings(
     return synced, saved_recordings
 
 
-async def main(token_hex: str | None = None, bootloader: bool = False) -> None:
+async def main(
+    token_hex: str | None = None,
+    bootloader: bool = False,
+) -> None:
     log("Middle BLE sync client started.")
     log(f"Scanning for pendant (service {SERVICE_UUID})...")
 

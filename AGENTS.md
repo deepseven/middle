@@ -24,23 +24,34 @@
 
 ## firmware commands (platformio)
 - Install PlatformIO Core if missing: `pipx install platformio` or equivalent.
-- **Two board environments exist** — pick the right one:
-  - `esp32-s3-devkitc-1`: original dev-board (external INMP441 I2S mic).
-  - `xiao_esp32s3_sense`: Seeed XIAO ESP32S3 Sense (built-in PDM mic, OLED).
-  - `m5stick_c_plus2`: M5StickC Plus2 (ESP32-PICO-V3-02, built-in PDM mic, TFT).
-- Build firmware: `pio run -e esp32-s3-devkitc-1` (or `-e xiao_esp32s3_sense` or `-e m5stick_c_plus2`).
-- Build and upload firmware over USB: `pio run -e <ENV> -t upload`.
-- Open serial monitor: `pio device monitor -b 115200`.
-- Upload filesystem image (LittleFS): `pio run -e <ENV> -t uploadfs`.
-- Clean build artifacts: `pio run -e <ENV> -t clean`.
-- Print detected serial devices: `pio device list`.
+- **Four board environments exist** — pick the right one:
+  - `esp32-s3-devkitc-1` (alias `devkit`): original dev-board (external INMP441 I2S mic).
+  - `xiao_esp32s3_sense` (alias `xiao`): Seeed XIAO ESP32S3 Sense (built-in PDM mic, OLED).
+  - `m5stick_c_plus2` (alias `plus2`): M5StickC Plus2 (ESP32-PICO-V3-02, built-in PDM mic, TFT).
+  - `m5stick_s3` (alias `s3`): M5StickS3 (ESP32-S3-PICO-1, built-in PDM mic, TFT, M5Unified).
+- **Convenience script** (preferred): `.\pio.ps1 <command> <board-alias>`.
+  - `.\pio.ps1 build s3` — build firmware for M5StickS3.
+  - `.\pio.ps1 flash plus2` — build + upload to M5StickC Plus2.
+  - `.\pio.ps1 monitor` — open serial monitor (auto-detect port).
+  - `.\pio.ps1 clean xiao` — clean build artifacts.
+  - `.\pio.ps1 build all` — build all environments.
+  - `.\pio.ps1 list` — show available boards and commands.
+  - `.\pio.ps1 devices` — list connected serial devices.
+- Raw PlatformIO commands still work:
+  - Build firmware: `pio run -e esp32-s3-devkitc-1` (or `-e xiao_esp32s3_sense` etc.).
+  - Build and upload firmware over USB: `pio run -e <ENV> -t upload`.
+  - Open serial monitor: `pio device monitor -b 115200`.
+  - Upload filesystem image (LittleFS): `pio run -e <ENV> -t uploadfs`.
+  - Clean build artifacts: `pio run -e <ENV> -t clean`.
+  - Print detected serial devices: `pio device list`.
 - **Uploading flashes only the firmware partition** — existing recordings on
   LittleFS survive. Use `-t uploadfs` to wipe the filesystem when needed.
 
 ## static analysis and linting
 - There is no configured formatter or linter config checked into this repo.
 - Use PlatformIO static checks for firmware when needed:
-  - `pio check -e esp32-s3-devkitc-1` (or `xiao_esp32s3_sense` or `m5stick_c_plus2`).
+  - `pio check -e esp32-s3-devkitc-1` (or `xiao_esp32s3_sense`, `m5stick_c_plus2`, `m5stick_s3`).
+  - Via convenience script: `.\pio.ps1 check s3`.
 - If you add a formatter or linter, document exact commands here.
 
 ## python script commands
